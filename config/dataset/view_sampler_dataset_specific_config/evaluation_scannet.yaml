@@ -1,0 +1,5 @@
+# @package _global_
+
+dataset:
+  view_sampler:
+    index_path: /data2/xxy/code/FreeSplat/assets/evaluation_index_scannet_2views.json
