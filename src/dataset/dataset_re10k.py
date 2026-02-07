@@ -352,6 +352,7 @@ class DatasetRE10k(IterableDataset):
                     continue
 
                 nf_scale = 1.0
+
                 if self.vggt_meta:
                     example = {
                         "context": {

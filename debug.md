@@ -1,0 +1,2 @@
+- can not match type "dict" to any type of "model.encoder" union: src.model.encoder.efficient_encoder.EfficientEncoderCfg | src.model.encoder.encoder_depthsplat.EncoderDepthSplatCfg | src.model.encoder.encoder_voxelsplat.EncoderVoxelSplatCfg
+    - 逐个检查yaml和cfg define是否符合。一定是这里的问题。

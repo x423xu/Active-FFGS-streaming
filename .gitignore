@@ -6,6 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
+# Packaging
+*.egg-info/
+dist/
+build/
+*.pyc
+
 # Distribution / packaging
 .Python
 build/
@@ -209,3 +215,7 @@ __marimo__/
 artifacts/
 outputs/
 checkpoints/
+scripts/
+lightning_logs/
+notes/
+pretrained_weights/

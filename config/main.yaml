@@ -1,7 +1,7 @@
 defaults:
-  - dataset: re10k_unbounded
+  - dataset: re10k_bounded
   - optional dataset/view_sampler_dataset_specific_config: ${dataset/view_sampler}_${dataset}
-  - model/encoder: depthsplat
+  - model/encoder: efficient_encoder
   - model/decoder: splatting_cuda
   - loss: [mse]
 
