@@ -108,3 +108,4 @@ train_controller:
   random_scale: false
   knn_down: false
   gaussian_merge: false
+  depth_distillation: false

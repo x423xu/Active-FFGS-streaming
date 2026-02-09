@@ -179,10 +179,10 @@ class ModelWrapper(LightningModule):
         # when training the gscube, the base_model is freezed
         self.gs_cube = train_controller_cfg.gs_cube if train_controller_cfg else False
         self.vggt_meta = train_controller_cfg.vggt_meta if train_controller_cfg else False
-        if not train_controller_cfg.base_model:
-            for name, param in self.encoder.named_parameters():
-                if ("gs_cube_encoder"  not in name) and ("gaussian_merger" not in name) and ("gaussian_scorer" not in name):
-                    param.requires_grad = False
+        # if not train_controller_cfg.base_model:
+        #     for name, param in self.encoder.named_parameters():
+        #         if ("gs_cube_encoder"  not in name) and ("gaussian_merger" not in name) and ("gaussian_scorer" not in name):
+        #             param.requires_grad = False
 
         # This is used for testing.
         self.benchmarker = Benchmarker()
@@ -294,7 +294,10 @@ class ModelWrapper(LightningModule):
                     self.log(f"train/nog_pb_{i}", nog_pb[i], prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
                 self.log("train/nog_min", nog_min, prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
                 # print(f'rank_id:{self.trainer.local_rank}',f'global_step:{self.global_step+1}',batch['scene'], 'nog_pb:', [f'{pb:.4f}' for pb in nog_pb], f'nog_min: {nog_min:.4f}', flush=True)
-            pred_depths = gaussians["depths"]
+            pred_depths = gaussians["depths"] 
+            if self.train_controller_cfg.depth_distillation:
+                ai_mae_loss = gaussians["ai_mae_loss"]
+                self.log("loss/ai_mae_loss", ai_mae_loss, prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
             gaussians = gaussians["gaussians"]
             
             
@@ -397,6 +400,8 @@ class ModelWrapper(LightningModule):
                 )
             self.log(f"loss/{loss_fn.name}", loss, prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
             total_loss = total_loss + loss
+        if self.train_controller_cfg.depth_distillation:
+            total_loss = total_loss + ai_mae_loss
 
         # color loss on intermediate output
         if supervise_intermediate_depth:
@@ -975,6 +980,21 @@ class ModelWrapper(LightningModule):
 
         if isinstance(gaussians_softmax, dict):
             pred_depths = gaussians_softmax["depths"]
+            if self.train_controller_cfg.depth_distillation:
+                teacher_depths = gaussians_softmax["teacher_depth"][0]  # [B, V, H, W]
+                teacher_depths = F.interpolate(
+                    teacher_depths.unsqueeze(1),
+                    size=batch["context"]["image"].shape[-2:],
+                    mode="bilinear",
+                    align_corners=True,
+                ).squeeze(1)
+                inverse_teacher_depths = 1.0 / teacher_depths
+                concat = []
+                for i in range(inverse_teacher_depths.size(0)):
+                    concat.append(inverse_teacher_depths[i])
+                concat = torch.cat(concat, dim=1)  # [H, W*N]
+                teacher_depth_viz = viz_depth_tensor(concat.cpu().detach())
+
             if "depth" in batch["context"]:
                 depth_gt = batch["context"]["depth"]  # [B, V, H, W]
             gaussians_softmax = gaussians_softmax["gaussians"]
@@ -1041,10 +1061,14 @@ class ModelWrapper(LightningModule):
             input_images = batch["context"]["image"][0]  # [N, 3, H, W]
             concat_img = [img for img in input_images]
             concat_img = torch.cat(concat_img, dim=-1) * 255  # [3, H, W*N]
-
-            concat = torch.cat(
-                (concat_img.cpu().detach(), depth_viz), dim=1
-            )  # [3, H*2, W*N]
+            if self.train_controller_cfg.depth_distillation:
+                concat = torch.cat(
+                    (concat_img.cpu().detach(), teacher_depth_viz, depth_viz), dim=1
+                )  # [3, H*2, W*N]
+            else:
+                concat = torch.cat(
+                    (concat_img.cpu().detach(), depth_viz), dim=1
+                )  # [3, H*2, W*N]
 
             self.logger.log_image(
                 "depth",

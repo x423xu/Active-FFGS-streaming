@@ -80,6 +80,9 @@
                 // "checkpointing.pretrained_monodepth=pretrained/depth_anything_v2_vits.pth",
                 // "checkpointing.pretrained_mvdepth=pretrained/gmflow-scale1-things-e9887eda.pth",
                 "output_dir=checkpoints/tmp",
+                "dataset.image_shape=[252,252]",
+                "train_controller.depth_distillation=true",
+                "dataset.near=0.01",
                 // "checkpointing.no_strict_load=true",
             ]
         },

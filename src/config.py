@@ -52,6 +52,7 @@ class TrainControllerCfg:
     random_scale: bool
     knn_down: bool
     gaussian_merge: bool
+    depth_distillation: bool
 
 @dataclass
 class RootCfg:

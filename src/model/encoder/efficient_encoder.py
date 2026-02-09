@@ -1,10 +1,14 @@
 from .encoder import Encoder
 import torch
+import torch.nn as nn
 from typing import Optional
 from typing import Literal, List
 from dataclasses import dataclass
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, GaussianCubeAdapter, DenseGaussianAdapter
 from .mde.mono_feature_extractor import MonoFeatureExtractor
+from einops import rearrange
+from ...geometry.projection import sample_image_grid
+from ..types import Gaussians
 
 @dataclass
 class EfficientEncoderCfg:
@@ -62,12 +66,32 @@ class EfficientEncoderCfg:
 class EfficientEncoder(Encoder[EfficientEncoderCfg]):
     def __init__(self, 
                  cfg: EfficientEncoderCfg, 
+                 depth_distillation: bool = False
                 ) -> None:
         super().__init__(cfg)
+        self.gaussian_adapter = GaussianAdapter(cfg.gaussian_adapter)
+        self.depth_predictor = MonoFeatureExtractor(cfg, depth_distillation=depth_distillation)
 
-        self.depth_predictor = MonoFeatureExtractor(cfg)
+        channels = self.cfg.gaussian_regressor_channels
+        # conv regressor
+        modules = [
+                    nn.Conv2d(32, channels, 3, 1, 1),
+                    nn.GELU(),
+                    nn.Conv2d(channels, channels, 3, 1, 1),
+                ]
 
+        self.gaussian_regressor = nn.Sequential(*modules)
+        in_channels = channels + 3  # add RGB image as input
+        num_gaussian_parameters = self.gaussian_adapter.d_in + 2 + 1
+        self.gaussian_head = nn.Sequential(
+                nn.Conv2d(in_channels, num_gaussian_parameters,
+                          3, 1, 1, padding_mode='replicate'),
+                nn.GELU(),
+                nn.Conv2d(num_gaussian_parameters,
+                          num_gaussian_parameters, 3, 1, 1, padding_mode='replicate')
+            )
 
+        self.depth_distillation = depth_distillation
         '''
         pre-train depth predictor, no downsampling
         '''
@@ -84,6 +108,116 @@ class EfficientEncoder(Encoder[EfficientEncoderCfg]):
         random_scale: bool = False,
         return_selected_ind: bool = False,
     ):
+        b, v, _, h, w = context["image"].shape
+        device = context["image"].device
         # Implement the forward pass for the efficient encoder
-        depth = self.depth_predictor(context['image'])
-        return depth
+        if self.depth_distillation:
+            eps = 1e-6
+            features, depth, depth_inverse, teacher_depth, teacher_depth_inverse = self.depth_predictor(context['image'],
+                                                min_depth=context["near"],
+                                                max_depth=context["far"])
+            B, C, H, W = depth.shape
+            N = H * W
+            depth_reshape = rearrange(depth_inverse, "b c h w -> b (c h w)")
+            teacher_depth_reshape = rearrange(teacher_depth_inverse, "b h w -> b (h w)")
+            pred_med = depth_reshape.median(dim=1, keepdim=True).values
+            targ_med = teacher_depth_reshape.median(dim=1, keepdim=True).values
+            pred_mad = (depth_reshape - pred_med).abs().mean(dim=1, keepdim=True)
+            targ_mad = (teacher_depth_reshape - targ_med).abs().mean(dim=1, keepdim=True)
+            pred_hat = (depth_reshape - pred_med) / (pred_mad + eps)
+            targ_hat = (teacher_depth_reshape - targ_med) / (targ_mad + eps)
+            ai_mae_loss = (pred_hat - targ_hat).abs().mean()
+            
+        else:
+            features, depth = self.depth_predictor(context['image'],
+                                                    min_depth=context["near"],
+                                                    max_depth=context["far"])
+        gaussian_features = self.gaussian_regressor(features)
+        concat = torch.cat([gaussian_features, 
+                            rearrange(context["image"],"b v c h w -> (b v) c h w")], dim=1)
+        gaussians = self.gaussian_head(concat)  # [BV, C, H, W]
+        depths = rearrange(depth, "(b v) c h w -> b v (c h w) () ()", b=b, v=v)
+        raw_gaussians = rearrange(
+                gaussians, "(b v) c h w -> b v (h w) c", b=b, v=v)
+        
+        opacities = raw_gaussians[..., :1].sigmoid().unsqueeze(-1)
+        raw_gaussians = raw_gaussians[..., 1:]
+
+        xy_ray, _ = sample_image_grid((h, w), device)
+        xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
+        gaussians = rearrange(
+            raw_gaussians,
+            "... (srf c) -> ... srf c",
+            srf=self.cfg.num_surfaces,
+        )
+        offset_xy = gaussians[..., :2].sigmoid()
+        
+        pixel_size = 1 / \
+            torch.tensor((w, h), dtype=torch.float32, device=device)
+        xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
+        sh_input_images = context["image"]
+        gaussians = self.gaussian_adapter.forward(
+                    rearrange(context["extrinsics"],
+                            "b v i j -> b v () () () i j"),
+                    rearrange(context["intrinsics"],
+                            "b v i j -> b v () () () i j"),
+                    rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
+                    depths,
+                    opacities,
+                    rearrange(
+                        gaussians[..., 2:],
+                        "b v r srf c -> b v r srf () c",
+                    ),
+                    (h, w),
+                    input_images=sh_input_images if self.cfg.init_sh_input_img else None,
+                    vggt_meta=False,
+                )
+        # Dump visualizations if needed.
+        if visualization_dump is not None:
+            visualization_dump["depth"] = rearrange(
+                depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
+            )
+            visualization_dump["scales"] = rearrange(
+                gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
+            )
+            visualization_dump["rotations"] = rearrange(
+                gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"
+            )
+
+        # print('scale max', gaussians.scales.max())
+        gaussians = Gaussians(
+                rearrange(
+                    gaussians.means,
+                    "b v r srf spp xyz -> b (v r srf spp) xyz",
+                ),
+                rearrange(
+                    3*gaussians.covariances,
+                    "b v r srf spp i j -> b (v r srf spp) i j",
+                ),
+                rearrange(
+                    gaussians.harmonics,
+                    "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
+                ),
+                rearrange(
+                    gaussians.opacities,
+                    "b v r srf spp -> b (v r srf spp)",
+                ),
+            )
+        
+        if self.cfg.return_depth:
+                # return depth prediction for supervision
+                depths = rearrange(
+                    depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
+                ).squeeze(-1).squeeze(-1)
+                # print(depths.shape)  # [B, V, H, W]
+                return_dict = {
+                    "gaussians": gaussians,
+                    "depths": depths
+                }
+                if self.depth_distillation:
+                    return_dict.update({"ai_mae_loss": ai_mae_loss})
+                    return_dict.update({"teacher_depth": rearrange(
+                        teacher_depth, "(b v) h w -> b v h w", b=b, v=v
+                    )})
+                return return_dict
+        return gaussians

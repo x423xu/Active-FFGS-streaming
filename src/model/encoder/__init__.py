@@ -20,7 +20,8 @@ def get_encoder(cfg: EncoderCfg,
                 gs_cube: bool, 
                 vggt_meta:bool,
                 knn_down:bool=False,
-                gaussian_merge:bool=False
+                gaussian_merge:bool=False,
+                depth_distillation:bool=False
                 ) -> tuple[Encoder, Optional[EncoderVisualizer]]:
     encoder, visualizer = ENCODERS[cfg.name]
     if cfg.name == "depthsplat":
@@ -28,7 +29,7 @@ def get_encoder(cfg: EncoderCfg,
     if cfg.name == "voxelsplat":
         encoder = encoder(cfg, gs_cube, vggt_meta)
     if cfg.name == "efficient_encoder":
-        encoder = encoder(cfg)
+        encoder = encoder(cfg, depth_distillation)
     if visualizer is not None:
         visualizer = visualizer(cfg.visualizer, encoder)
     return encoder, visualizer
