@@ -53,6 +53,8 @@ class TrainControllerCfg:
     knn_down: bool
     gaussian_merge: bool
     depth_distillation: bool
+    teacher_depth: Optional[str]
+    embedding_type: Optional[str]
 
 @dataclass
 class RootCfg:

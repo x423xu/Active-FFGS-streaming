@@ -62,6 +62,7 @@ class DatasetRE10k(IterableDataset):
         stage: Stage,
         view_sampler: ViewSampler,
         vggt_meta: bool = False,
+        train_controller_cfg = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -69,6 +70,7 @@ class DatasetRE10k(IterableDataset):
         self.view_sampler = view_sampler
         self.to_tensor = tf.ToTensor()
         self.vggt_meta = vggt_meta
+        self.train_controller_cfg = train_controller_cfg
         if cfg.near != -1:
             self.near = cfg.near
         if cfg.far != -1:
@@ -76,7 +78,9 @@ class DatasetRE10k(IterableDataset):
 
         # Collect chunks.
         self.chunks = []
-        if self.vggt_meta:
+        use_vggt = self.vggt_meta or (self.train_controller_cfg.depth_distillation and self.train_controller_cfg.teacher_depth == "vggt")
+        self.use_vggt = use_vggt
+        if use_vggt:
             self.vggt_chunk_path = Path("/data2/xxy/data/re10k_vggt_meta") / self.data_stage
         for i, root in enumerate(cfg.roots):
             root = root / self.data_stage
@@ -120,7 +124,7 @@ class DatasetRE10k(IterableDataset):
         depth = depth/255.0 * (depth_max[:,None,None,None] - depth_min[:,None,None,None]) + depth_min[:,None,None,None]
         depth = torch.tensor(depth, dtype=torch.float32)
         depth_conf = torch.tensor(depth_conf, dtype=torch.float32)
-        extrinsics_vggt = torch.tensor(extrinsics_vggt, dtype=torch.float32) # inverse to follow re10k
+        extrinsics_vggt = torch.tensor(extrinsics_vggt, dtype=torch.float32)
         extrinsics_vggt = torch.cat([extrinsics_vggt, torch.tensor([[0, 0, 0, 1]], dtype=torch.float32).repeat(extrinsics_vggt.shape[0], 1, 1)], dim=1).inverse()
         intrinsics_vggt = torch.tensor(intrinsics_vggt, dtype=torch.float32)
         img_sizes_vggt = torch.tensor(img_sizes_vggt, dtype=torch.int32)
@@ -231,7 +235,7 @@ class DatasetRE10k(IterableDataset):
                 item = [x for x in chunk if x["key"] == self.cfg.overfit_to_scene]
                 assert len(item) == 1
                 chunk = item * len(chunk)
-            if self.vggt_meta:
+            if self.use_vggt:
                 vggt_meta_chunk_path = self.vggt_chunk_path / chunk_path.name.replace('.torch', '.h5')
                 if not os.path.exists(vggt_meta_chunk_path):
                     print(f'{vggt_meta_chunk_path} is not ready')
@@ -254,7 +258,7 @@ class DatasetRE10k(IterableDataset):
                     chunk_vggt = item_vggt * len(chunk_vggt)
 
             if self.stage in (("train", "val") if self.cfg.shuffle_val else ("train")):
-                if self.vggt_meta:
+                if self.use_vggt:
                     chunk, indices = self.shuffle(chunk, return_indices=True)
                     chunk_vggt = [chunk_vggt[i] for i in indices]
                 else:
@@ -276,7 +280,7 @@ class DatasetRE10k(IterableDataset):
                 scene = example["key"]
 
 
-                if self.vggt_meta:
+                if self.use_vggt:
                     example_vggt = chunk_vggt[run_idx // times_per_scene]
                     extrinsics_vggt = example_vggt["extrinsic"]
                     intrinsics_vggt = example_vggt["intrinsic"]
@@ -316,21 +320,21 @@ class DatasetRE10k(IterableDataset):
                 context_images = [
                     example["images"][index.item()] for index in context_indices
                 ]
-                if self.vggt_meta:
+                if self.use_vggt:
                     context_images = self.convert_images(context_images, resize_shape=img_sizes[context_indices])
                 else:
                     context_images = self.convert_images(context_images)
                 target_images = [
                     example["images"][index.item()] for index in target_indices
                 ]
-                if self.vggt_meta:
+                if self.use_vggt:
                     target_images = self.convert_images(target_images, resize_shape=img_sizes[target_indices])
                 else:
                     target_images = self.convert_images(target_images)
 
 
                 # Skip the example if the images don't have the right shape.
-                if self.vggt_meta:
+                if self.use_vggt:
                     if self.cfg.highres:
                         expected_shape = (3, 588, 1036)
                     else:
@@ -353,7 +357,7 @@ class DatasetRE10k(IterableDataset):
 
                 nf_scale = 1.0
 
-                if self.vggt_meta:
+                if self.use_vggt:
                     example = {
                         "context": {
                             "extrinsics": extrinsics_vggt[context_indices],
@@ -397,15 +401,17 @@ class DatasetRE10k(IterableDataset):
                             "far": self.get_bound("far", len(target_indices)) / nf_scale,
                             "index": target_indices,
                         },
-                        "scene": scene,
-                        
+                        "scene": scene,    
                     }
+                    # if self.train_controller_cfg.depth_distillation and self.train_controller_cfg.teacher_depth == "vggt":
+                    #     example["context"]["depth"] = depth[context_indices]
+                    #     example["target"]["depth"] = depth[target_indices]
 
                 if DEBUG:
                     from PIL import Image
                     import numpy as np
                     import matplotlib.pyplot as plt
-                    from ..geometry.vggt_geometry import unproject_depth_map_to_point_map
+                    from ..geometry.geometry import unproject_depth_map_to_point_map
 
                     def render_pcs(points, colors, opacities, num):
                         points = points.squeeze().detach().cpu().numpy()
@@ -426,10 +432,10 @@ class DatasetRE10k(IterableDataset):
                         ax.invert_zaxis()  
                         fig.savefig(f"point_cloud_{num}.png", dpi=300)
                         plt.close(fig)
-
+                    
                     images = example['context']['image']
                     depth = example['context']['depth']
-                    extrinsic = example['context']['extrinsics'].inverse()
+                    extrinsic = example['context']['extrinsics']
                     intrinsic = example['context']['intrinsics']
                     indices = [torch.arange(length) for length in depth.shape[-2:]]
                     coordinates = torch.stack(torch.meshgrid(*indices, indexing="ij"), dim=-1).to(depth)
@@ -437,11 +443,12 @@ class DatasetRE10k(IterableDataset):
                     coordinates = repeat(coordinates, "h w c-> n h w c", n=v)
                     images = rearrange(images, "v c h w -> v h w c")
                     points = unproject_depth_map_to_point_map(
-                        coordinates=coordinates,
-                        depth_map=depth,
+                        # coordinates=coordinates,
+                        depth_map=depth.unsqueeze(-1),
                         extrinsics_cam=extrinsic,
                         intrinsics_cam=intrinsic
                     )
+                    points=torch.tensor(points)
                     points = points.reshape(-1,3).cpu()
                     # points = means2.reshape(-1, 3)
                     colors = images.reshape(-1,3).cpu()
@@ -468,7 +475,7 @@ class DatasetRE10k(IterableDataset):
                 if self.vggt_meta:            
                     yield apply_crop_shim_forvggt(example, tuple(self.cfg.image_shape))
                 else:
-                    yield apply_crop_shim(example, tuple(self.cfg.image_shape))
+                    yield apply_crop_shim(example, tuple(self.cfg.image_shape), distill=self.train_controller_cfg.depth_distillation and self.train_controller_cfg.teacher_depth == "vggt")
     def convert_poses(
         self,
         poses: Float[Tensor, "batch 18"],

@@ -105,21 +105,32 @@ def rescale_and_crop(
     return center_crop(images, intrinsics, shape, depths=depths)
 
 
-def apply_crop_shim_to_views(views: AnyViews, shape: tuple[int, int]) -> AnyViews:
-    images, intrinsics = rescale_and_crop(
-        views["image"], views["intrinsics"], shape, depths=None
-    )
-    return {
+def apply_crop_shim_to_views(views: AnyViews, shape: tuple[int, int], distill:bool) -> AnyViews:
+    if distill:
+        depths = views["depth"]
+        images, intrinsics, depth = rescale_and_crop(
+        views["image"], views["intrinsics"], shape, depths=depths
+        )
+        return {
         **views,
         "image": images,
         "intrinsics": intrinsics,
-    }
+        "depth": depth}
+    else:        
+        images, intrinsics = rescale_and_crop(
+        views["image"], views["intrinsics"], shape, depths=None
+        )
+        return {
+            **views,
+            "image": images,
+            "intrinsics": intrinsics,
+        }
 
 
-def apply_crop_shim(example: AnyExample, shape: tuple[int, int]) -> AnyExample:
+def apply_crop_shim(example: AnyExample, shape: tuple[int, int], distill:bool) -> AnyExample:
     """Crop images in the example."""
     return {
         **example,
-        "context": apply_crop_shim_to_views(example["context"], shape),
-        "target": apply_crop_shim_to_views(example["target"], shape),
+        "context": apply_crop_shim_to_views(example["context"], shape, distill=distill),
+        "target": apply_crop_shim_to_views(example["target"], shape, distill=distill),
     }

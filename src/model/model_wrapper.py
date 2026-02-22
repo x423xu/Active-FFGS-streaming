@@ -178,7 +178,8 @@ class ModelWrapper(LightningModule):
 
         # when training the gscube, the base_model is freezed
         self.gs_cube = train_controller_cfg.gs_cube if train_controller_cfg else False
-        self.vggt_meta = train_controller_cfg.vggt_meta if train_controller_cfg else False
+        # self.vggt_meta = train_controller_cfg.vggt_meta if train_controller_cfg else False
+        self.vggt_meta = train_controller_cfg.depth_distillation and train_controller_cfg.teacher_depth == "vggt"
         # if not train_controller_cfg.base_model:
         #     for name, param in self.encoder.named_parameters():
         #         if ("gs_cube_encoder"  not in name) and ("gaussian_merger" not in name) and ("gaussian_scorer" not in name):
@@ -401,7 +402,7 @@ class ModelWrapper(LightningModule):
             self.log(f"loss/{loss_fn.name}", loss, prog_bar=True,rank_zero_only=False, on_step=True,sync_dist=False)
             total_loss = total_loss + loss
         if self.train_controller_cfg.depth_distillation:
-            total_loss = total_loss + ai_mae_loss
+            total_loss = total_loss + 0.01*ai_mae_loss
 
         # color loss on intermediate output
         if supervise_intermediate_depth:

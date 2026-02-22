@@ -219,3 +219,4 @@ scripts/
 lightning_logs/
 notes/
 pretrained_weights/
+*.png

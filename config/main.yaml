@@ -109,3 +109,5 @@ train_controller:
   knn_down: false
   gaussian_merge: false
   depth_distillation: false
+  teacher_depth: null
+  embedding_type: null

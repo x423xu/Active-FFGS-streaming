@@ -170,7 +170,8 @@ def train(cfg_dict: DictConfig):
                                               vggt_meta=cfg.train_controller.vggt_meta,
                                               knn_down=cfg.train_controller.knn_down,
                                               gaussian_merge=cfg.train_controller.gaussian_merge,
-                                              depth_distillation=cfg.train_controller.depth_distillation)
+                                              depth_distillation=cfg.train_controller.depth_distillation,
+                                              train_controller_cfg = cfg.train_controller)
 
     model_wrapper = ModelWrapper(
         cfg.optimizer,

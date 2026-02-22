@@ -80,6 +80,7 @@ class DataModule(LightningDataModule):
         self.dataset_shim = dataset_shim
         self.global_rank = global_rank
         self.vggt_meta = train_controller_cfg.vggt_meta
+        self.train_controller_cfg = train_controller_cfg
 
     def get_persistent(self, loader_cfg: DataLoaderStageCfg) -> bool | None:
         return None if loader_cfg.num_workers == 0 else loader_cfg.persistent_workers
@@ -92,7 +93,7 @@ class DataModule(LightningDataModule):
         return generator
 
     def train_dataloader(self):
-        dataset = get_dataset(self.dataset_cfg, "train", self.step_tracker, vggt_meta=self.vggt_meta)
+        dataset = get_dataset(self.dataset_cfg, "train", self.step_tracker, vggt_meta=self.vggt_meta, train_controller_cfg=self.train_controller_cfg)
         dataset = self.dataset_shim(dataset, "train")
         return DataLoader(
             dataset,
@@ -106,7 +107,7 @@ class DataModule(LightningDataModule):
         )
 
     def val_dataloader(self):
-        dataset = get_dataset(self.dataset_cfg, "val", self.step_tracker, vggt_meta=self.vggt_meta)
+        dataset = get_dataset(self.dataset_cfg, "val", self.step_tracker, vggt_meta=self.vggt_meta,train_controller_cfg=self.train_controller_cfg)
         dataset = self.dataset_shim(dataset, "val")
         return DataLoader(
             ValidationWrapper(dataset, 1),
@@ -122,7 +123,8 @@ class DataModule(LightningDataModule):
             self.dataset_cfg if dataset_cfg is None else dataset_cfg,
             "test",
             self.step_tracker,
-            vggt_meta=self.vggt_meta
+            vggt_meta=self.vggt_meta,
+            train_controller_cfg=self.train_controller_cfg
         )
         dataset = self.dataset_shim(dataset, "test")
         return DataLoader(

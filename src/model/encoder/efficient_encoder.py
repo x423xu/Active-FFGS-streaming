@@ -66,11 +66,13 @@ class EfficientEncoderCfg:
 class EfficientEncoder(Encoder[EfficientEncoderCfg]):
     def __init__(self, 
                  cfg: EfficientEncoderCfg, 
-                 depth_distillation: bool = False
+                 depth_distillation: bool = False,
+                 train_controller_cfg = None
                 ) -> None:
         super().__init__(cfg)
         self.gaussian_adapter = GaussianAdapter(cfg.gaussian_adapter)
-        self.depth_predictor = MonoFeatureExtractor(cfg, depth_distillation=depth_distillation)
+        self.depth_predictor = MonoFeatureExtractor(cfg, depth_distillation=depth_distillation,
+                                                    train_controller_cfg=train_controller_cfg)
 
         channels = self.cfg.gaussian_regressor_channels
         # conv regressor
@@ -90,8 +92,14 @@ class EfficientEncoder(Encoder[EfficientEncoderCfg]):
                 nn.Conv2d(num_gaussian_parameters,
                           num_gaussian_parameters, 3, 1, 1, padding_mode='replicate')
             )
+        nn.init.zeros_(self.gaussian_head[-1].weight[3:6])
+        nn.init.zeros_(self.gaussian_head[-1].bias[3:6])
 
         self.depth_distillation = depth_distillation
+        self.use_vggt = depth_distillation and train_controller_cfg.teacher_depth == "vggt"
+        self.use_vda = depth_distillation and train_controller_cfg.teacher_depth == "vda"
+        self.use_dav2 = depth_distillation and train_controller_cfg.teacher_depth == "dav2"
+        self.embedding_type = train_controller_cfg.embedding_type if train_controller_cfg is not None else None
         '''
         pre-train depth predictor, no downsampling
         '''
@@ -111,11 +119,18 @@ class EfficientEncoder(Encoder[EfficientEncoderCfg]):
         b, v, _, h, w = context["image"].shape
         device = context["image"].device
         # Implement the forward pass for the efficient encoder
-        if self.depth_distillation:
+        if self.use_dav2:
             eps = 1e-6
-            features, depth, depth_inverse, teacher_depth, teacher_depth_inverse = self.depth_predictor(context['image'],
-                                                min_depth=context["near"],
-                                                max_depth=context["far"])
+            if self.embedding_type is not None:
+                features, depth, depth_inverse, teacher_depth, teacher_depth_inverse = self.depth_predictor(context['image'],
+                                                    min_depth=context["near"],
+                                                    max_depth=context["far"],
+                                                    extrinsics=context['extrinsics'],
+                                                    intrinsics=context['intrinsics'])
+            else:
+                features, depth, depth_inverse, teacher_depth, teacher_depth_inverse = self.depth_predictor(context['image'],
+                                                    min_depth=context["near"],
+                                                    max_depth=context["far"])
             B, C, H, W = depth.shape
             N = H * W
             depth_reshape = rearrange(depth_inverse, "b c h w -> b (c h w)")
@@ -127,11 +142,44 @@ class EfficientEncoder(Encoder[EfficientEncoderCfg]):
             pred_hat = (depth_reshape - pred_med) / (pred_mad + eps)
             targ_hat = (teacher_depth_reshape - targ_med) / (targ_mad + eps)
             ai_mae_loss = (pred_hat - targ_hat).abs().mean()
+        
+        elif self.use_vggt:
             
-        else:
-            features, depth = self.depth_predictor(context['image'],
+            eps = 1e-6
+            if self.embedding_type is not None:
+                features, depth = self.depth_predictor(context['image'],
+                                                    min_depth=context["near"],
+                                                    max_depth=context["far"],
+                                                    extrinsics=context['extrinsics'],
+                                                    intrinsics=context['intrinsics'])
+            else:
+                features, depth = self.depth_predictor(context['image'],
                                                     min_depth=context["near"],
                                                     max_depth=context["far"])
+            teacher_depth = context["depth"]
+            d_inverse = 1/depth
+            td_inverse = 1/teacher_depth
+            depth_reshape = rearrange(d_inverse, "b c h w -> b (c h w)")
+            teacher_depth_reshape = rearrange(td_inverse, "b v h w -> (b v) (h w)")
+            pred_med = depth_reshape.median(dim=1, keepdim=True).values
+            targ_med = teacher_depth_reshape.median(dim=1, keepdim=True).values
+            pred_mad = (depth_reshape - pred_med).abs().mean(dim=1, keepdim=True)
+            targ_mad = (teacher_depth_reshape - targ_med).abs().mean(dim=1, keepdim=True)
+            pred_hat = (depth_reshape - pred_med) / (pred_mad + eps)
+            targ_hat = (teacher_depth_reshape - targ_med) / (targ_mad + eps)
+            ai_mae_loss = (pred_hat - targ_hat).abs().mean()
+
+        else:
+            if self.embedding_type is not None:
+                features, depth = self.depth_predictor(context['image'],
+                                                        min_depth=context["near"],
+                                                        max_depth=context["far"],
+                                                        extrinsics=context['extrinsics'],
+                                                        intrinsics=context['intrinsics'])
+            else:
+                features, depth = self.depth_predictor(context['image'],
+                                                        min_depth=context["near"],
+                                                        max_depth=context["far"])
         gaussian_features = self.gaussian_regressor(features)
         concat = torch.cat([gaussian_features, 
                             rearrange(context["image"],"b v c h w -> (b v) c h w")], dim=1)
@@ -143,7 +191,10 @@ class EfficientEncoder(Encoder[EfficientEncoderCfg]):
         opacities = raw_gaussians[..., :1].sigmoid().unsqueeze(-1)
         raw_gaussians = raw_gaussians[..., 1:]
 
-        xy_ray, _ = sample_image_grid((h, w), device)
+        if self.use_vggt:
+            _, xy_ray = sample_image_grid((h, w), device)
+        else:
+            xy_ray, _ = sample_image_grid((h, w), device)
         xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
         gaussians = rearrange(
             raw_gaussians,
@@ -170,7 +221,7 @@ class EfficientEncoder(Encoder[EfficientEncoderCfg]):
                     ),
                     (h, w),
                     input_images=sh_input_images if self.cfg.init_sh_input_img else None,
-                    vggt_meta=False,
+                    vggt_meta=self.use_vggt,
                 )
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -214,10 +265,13 @@ class EfficientEncoder(Encoder[EfficientEncoderCfg]):
                     "gaussians": gaussians,
                     "depths": depths
                 }
-                if self.depth_distillation:
+                if self.use_dav2:
                     return_dict.update({"ai_mae_loss": ai_mae_loss})
                     return_dict.update({"teacher_depth": rearrange(
                         teacher_depth, "(b v) h w -> b v h w", b=b, v=v
                     )})
+                if self.use_vggt:
+                    return_dict.update({"ai_mae_loss": ai_mae_loss})
+                    return_dict.update({"teacher_depth": teacher_depth})
                 return return_dict
         return gaussians

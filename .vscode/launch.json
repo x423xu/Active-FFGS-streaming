@@ -61,7 +61,8 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
-                "CUDA_VISIBLE_DEVICES": "7",
+                "CUDA_VISIBLE_DEVICES": "9",
+                "PYTHONPATH": "/data0/xxy/code/Active-FFGS-streaming/src/third_party/video_depth_anything:${env:PYTHONPATH}"
                 // "MASTER_ADDR": "localhost",
                 // "MASTER_PORT": "12345",
             },
@@ -71,6 +72,7 @@
                 "data_loader.train.batch_size=2",
                 "wandb.mode=disabled",
                 "model.encoder.name=efficient_encoder",
+                // "model.encoder.name=voxelsplat",
                 "dataset.test_chunk_interval=10",
                 "trainer.max_steps=300000",
                 "model.encoder.upsample_factor=4",
@@ -82,8 +84,11 @@
                 "output_dir=checkpoints/tmp",
                 "dataset.image_shape=[252,252]",
                 "train_controller.depth_distillation=true",
+                "train_controller.teacher_depth=vggt",
+                "train_controller.embedding_type=plucker_ray",
                 "dataset.near=0.01",
                 // "checkpointing.no_strict_load=true",
+                "train_controller.vggt_meta=true",
             ]
         },
         {
