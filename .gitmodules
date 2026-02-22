@@ -1,3 +1,6 @@
 [submodule "src/third_party/depth_anything_v2"]
 	path = src/third_party/depth_anything_v2
 	url = https://github.com/DepthAnything/Depth-Anything-V2
+[submodule "src/third_party/video_depth_anything"]
+	path = src/third_party/video_depth_anything
+	url = https://github.com/DepthAnything/Video-Depth-Anything.git
