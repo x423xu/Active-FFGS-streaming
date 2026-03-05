@@ -5,11 +5,17 @@ from typing import Optional
 from typing import Literal, List
 from dataclasses import dataclass
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, GaussianCubeAdapter, DenseGaussianAdapter
-from .mde.mono_feature_extractor import MonoFeatureExtractor
+from .mvde.mv_feature_extractor import MVFeatureExtractor
 from einops import rearrange
 from ...geometry.projection import sample_image_grid
 from ..types import Gaussians
 
+TIMER=False
+if TIMER:
+    import time
+    def print_time(name, start_time):
+        elapsed = time.time() - start_time
+        print(f"{name} took {elapsed:.4f} seconds")
 @dataclass
 class EfficientEncoderCfg:
     name: Literal["efficient_encoder"]
@@ -71,9 +77,9 @@ class EfficientEncoder(Encoder[EfficientEncoderCfg]):
                 ) -> None:
         super().__init__(cfg)
         self.gaussian_adapter = GaussianAdapter(cfg.gaussian_adapter)
-        self.depth_predictor = MonoFeatureExtractor(cfg, depth_distillation=depth_distillation,
-                                                    train_controller_cfg=train_controller_cfg)
-
+  
+        self.depth_predictor = MVFeatureExtractor(cfg, depth_distillation=depth_distillation,
+                                                      train_controller_cfg=train_controller_cfg)
         channels = self.cfg.gaussian_regressor_channels
         # conv regressor
         modules = [

@@ -1,5 +1,6 @@
 name: efficient_encoder
 
+
 num_depth_candidates: 128
 num_surfaces: 1
 
