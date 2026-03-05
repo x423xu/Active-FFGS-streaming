@@ -4,16 +4,18 @@ from .encoder import Encoder
 from .encoder_depthsplat import EncoderDepthSplat, EncoderDepthSplatCfg
 from .encoder_voxelsplat import EncoderVoxelSplat, EncoderVoxelSplatCfg
 from .efficient_encoder import EfficientEncoderCfg, EfficientEncoder
+from .mono_model import MonoModelCfg, MonoModel
 from .visualization.encoder_visualizer import EncoderVisualizer
 from .visualization.encoder_visualizer_depthsplat import EncoderVisualizerDepthSplat
 
 ENCODERS = {
     "efficient_encoder":(EfficientEncoder, None),
+    "mono_model": (MonoModel, None),
     "depthsplat": (EncoderDepthSplat, EncoderVisualizerDepthSplat),
     "voxelsplat": (EncoderVoxelSplat, EncoderVisualizerDepthSplat),
 }
 
-EncoderCfg = EfficientEncoderCfg | EncoderDepthSplatCfg | EncoderVoxelSplatCfg
+EncoderCfg = EfficientEncoderCfg | MonoModelCfg | EncoderDepthSplatCfg | EncoderVoxelSplatCfg
 
 
 def get_encoder(cfg: EncoderCfg, 
@@ -29,7 +31,7 @@ def get_encoder(cfg: EncoderCfg,
         encoder = encoder(cfg, gs_cube, vggt_meta, knn_down, gaussian_merge)
     if cfg.name == "voxelsplat":
         encoder = encoder(cfg, gs_cube, vggt_meta)
-    if cfg.name == "efficient_encoder":
+    if cfg.name in ["efficient_encoder", "mono_model"]:
         encoder = encoder(cfg, depth_distillation,train_controller_cfg)
     if visualizer is not None:
         visualizer = visualizer(cfg.visualizer, encoder)

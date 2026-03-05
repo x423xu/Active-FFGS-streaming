@@ -22,3 +22,5 @@ test_len: -1
 test_chunk_interval: 1
 
 use_index_to_load_chunk: false
+min_views: 0
+max_views: 0

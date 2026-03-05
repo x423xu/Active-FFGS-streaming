@@ -4,6 +4,7 @@ from functools import cached_property
 from io import BytesIO
 from pathlib import Path
 from typing import Literal, Optional, Union
+import random
 
 import os
 import numpy as np
@@ -44,6 +45,8 @@ class DatasetRE10kCfg(DatasetCfgCommon):
     train_times_per_scene: int = 1
     highres: bool = False
     use_index_to_load_chunk: Optional[bool] = False
+    min_views: int = 0
+    max_views: int = 0
 
 
 class DatasetRE10k(IterableDataset):
@@ -71,10 +74,24 @@ class DatasetRE10k(IterableDataset):
         self.to_tensor = tf.ToTensor()
         self.vggt_meta = vggt_meta
         self.train_controller_cfg = train_controller_cfg
+        self.sampled_num_context_views: int | None = None
         if cfg.near != -1:
             self.near = cfg.near
         if cfg.far != -1:
             self.far = cfg.far
+
+        if (
+            self.stage != "test"
+            and self.cfg.min_views > 0
+            and self.cfg.max_views >= self.cfg.min_views
+        ):
+            self.sampled_num_context_views = random.randint(
+                self.cfg.min_views,
+                self.cfg.max_views,
+            )
+            print(
+                f"[dataset_re10k] fixed context views for this run: {self.sampled_num_context_views}"
+            )
 
         # Collect chunks.
         self.chunks = []
@@ -295,10 +312,19 @@ class DatasetRE10k(IterableDataset):
 
 
                 try:
+                    if self.sampled_num_context_views is None:
+                        min_context_views = self.cfg.min_views
+                        max_context_views = self.cfg.max_views
+                    else:
+                        min_context_views = self.sampled_num_context_views
+                        max_context_views = self.sampled_num_context_views
+
                     context_indices, target_indices = self.view_sampler.sample(
                         scene,
                         extrinsics,
                         intrinsics,
+                        min_context_views=min_context_views,
+                        max_context_views=max_context_views,
                     )
                 except ValueError:
                     # Skip because the example doesn't have enough frames.

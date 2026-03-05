@@ -82,6 +82,8 @@ class GSCubeHead(nn.Module):
         return x
 
 class GSCubeEncoder(Swin3DUNet):
+    _cube_profile_stats = None  # class-level dict filled when mono_model profiling is on
+
     def __init__(
             self, depths, channels, num_heads, window_sizes,
             quant_size, drop_path_rate=0.2, up_k=3,
@@ -165,7 +167,9 @@ class GSCubeEncoder(Swin3DUNet):
                 vggt_meta=False,
                 conf=None,
                 random_scale=False,
-                return_selected_ind=False):
+                return_selected_ind=False,
+                max_points_per_batch=-1,
+                conf_threshold=0.0):
         '''
         imgs: context images, shape: BxVxCxHxW, range: [0, 1]
         depth: depth map, shape: BxVxHxW
@@ -197,12 +201,25 @@ class GSCubeEncoder(Swin3DUNet):
             raise ValueError("xyzworld, depth: NaN or Inf detected in forward output")
         # s2: voxelization, each cell contains at most one point
         # print(xyz_world.shape, feats.shape)
+        _do_prof = (self.__class__._cube_profile_stats is not None)
+        if _do_prof:
+            torch.cuda.synchronize(device); torch.cuda.reset_peak_memory_stats(device)
+        import time as _time
+        _tv0 = _time.perf_counter()
         gs_cube_input, gs_cube_input_perview = self.voxelize(xyz_world, 
                       rearrange(feats,"b v l h w -> b (v h w) l"), 
                       rearrange(imgs,"b v c h w -> b (v h w) c"), 
                       num_depth, b=b, v=v, h=h, w=w, 
                       conf=rearrange(conf, "(b v) l h w -> b (v h w) l", b=b, v=v),
-                      return_perview=return_perview, random_scale=random_scale, return_selected_ind=return_selected_ind)
+                      return_perview=return_perview,
+                      random_scale=random_scale,
+                      return_selected_ind=return_selected_ind,
+                      max_points_per_batch=max_points_per_batch,
+                      conf_threshold=conf_threshold)
+        if _do_prof:
+            torch.cuda.synchronize(device)
+            self.__class__._cube_profile_stats['voxelize_time'] = _time.perf_counter() - _tv0
+            self.__class__._cube_profile_stats['voxelize_mem'] = torch.cuda.max_memory_allocated(device)/(1024**3)
         # gs_cube_input, gs_cube_input_perview = self.extensible_voxelization(xyz_world, 
         #               rearrange(feats,"b v l h w -> b (v h w) l"), 
         #               rearrange(imgs,"b v c h w -> b (v h w) c"), 
@@ -216,12 +233,33 @@ class GSCubeEncoder(Swin3DUNet):
         # torch.save(sparse_features, "visualize/sp_features.pth")
         # torch.save(gs_cube_input.sp.C,"visualize/sp_coordinates.pth")
 
+        _do_prof = (self.__class__._cube_profile_stats is not None)
+        if _do_prof:
+            torch.cuda.synchronize(device); torch.cuda.reset_peak_memory_stats(device)
+        import time as _time
+        _t0 = _time.perf_counter()
         sp_stack, coords_sp_stack, nog_min = self.encode(gs_cube_input.sp, gs_cube_input.coords_sp)
+        if _do_prof:
+            torch.cuda.synchronize(device)
+            self.__class__._cube_profile_stats['encode_time'] = _time.perf_counter() - _t0
+            self.__class__._cube_profile_stats['encode_mem'] = torch.cuda.max_memory_allocated(device)/(1024**3)
+            torch.cuda.reset_peak_memory_stats(device)
         # s4: decode
-
+        _t0 = _time.perf_counter()
         sp, coords_sp = self.decode(sp_stack, coords_sp_stack)
+        if _do_prof:
+            torch.cuda.synchronize(device)
+            self.__class__._cube_profile_stats['decode_time'] = _time.perf_counter() - _t0
+            self.__class__._cube_profile_stats['decode_mem'] = torch.cuda.max_memory_allocated(device)/(1024**3)
+            torch.cuda.reset_peak_memory_stats(device)
+        _t0 = _time.perf_counter()
         spf = self.gs_cube_head(sp.F)  # [N, KxC]
         sp = assign_feats(sp, spf)
+        if _do_prof:
+            torch.cuda.synchronize(device)
+            self.__class__._cube_profile_stats['head_time'] = _time.perf_counter() - _t0
+            self.__class__._cube_profile_stats['head_mem'] = torch.cuda.max_memory_allocated(device)/(1024**3)
+            self.__class__._cube_profile_stats['num_voxels'] = sp.C.shape[0]
         nog_pb = [(self.gpc*sp.C[:,0]==i).sum() for i in range(b)]
         # nog_pv = self.gpc*sp.C.shape[0]//(b * v)
         nog_min = nog_min // b
@@ -239,7 +277,7 @@ class GSCubeEncoder(Swin3DUNet):
     feats: NxL
     imgs: Nx3
     '''
-    def voxelize(self, xyz_world, feats, imgs, num_depth, b=None, v=None, h=None, w=None, conf=None, return_perview=False, random_scale=False, return_selected_ind=False):
+    def voxelize(self, xyz_world, feats, imgs, num_depth, b=None, v=None, h=None, w=None, conf=None, return_perview=False, random_scale=False, return_selected_ind=False, max_points_per_batch=-1, conf_threshold=0.0):
         '''
         some notes about intermidiate variables:
         xyz_world: world coordinates, shape: (b, v*h*w, 3), range: physical distances
@@ -293,10 +331,37 @@ class GSCubeEncoder(Swin3DUNet):
 
         
         for batch_idx in range(xyz_world.shape[0]):  
+            if conf is not None and (max_points_per_batch > 0 or conf_threshold > 0.0):
+                conf_batch = conf[batch_idx, :, 0]
+                if conf_threshold > 0.0:
+                    candidate_ind = torch.where(conf_batch >= conf_threshold)[0]
+                else:
+                    candidate_ind = torch.arange(conf_batch.shape[0], device=device)
+
+                if candidate_ind.numel() == 0:
+                    fallback_k = 1 if max_points_per_batch <= 0 else min(max_points_per_batch, conf_batch.shape[0])
+                    candidate_ind = torch.topk(conf_batch, k=fallback_k, sorted=False).indices
+
+                if max_points_per_batch > 0 and candidate_ind.numel() > max_points_per_batch:
+                    top_rel = torch.topk(conf_batch[candidate_ind], k=max_points_per_batch, sorted=False).indices
+                    candidate_ind = candidate_ind[top_rel]
+
+                grid_coords_batch = grid_coords[batch_idx, candidate_ind, :]
+                feats_batch = feats[batch_idx, candidate_ind, :]
+                imgs_batch = imgs[batch_idx, candidate_ind, :]
+                xyz_scaled_batch = xyz_scaled[batch_idx, candidate_ind, :]
+                conf_batch_full = conf[batch_idx, candidate_ind, :] if conf is not None else None
+            else:
+                grid_coords_batch = grid_coords[batch_idx, :, :]
+                feats_batch = feats[batch_idx, :, :]
+                imgs_batch = imgs[batch_idx, :, :]
+                xyz_scaled_batch = xyz_scaled[batch_idx, :, :]
+                conf_batch_full = conf[batch_idx, :, :] if conf is not None else None
+
             '''randomly select one within each voxel'''
             # Ensure each cell has at most one point
             unique_coords, inverse_ind, counts = torch.unique(
-                grid_coords[batch_idx,:,:], 
+                grid_coords_batch, 
                 dim=0, 
                 return_inverse=True, 
                 return_counts=True, 
@@ -304,21 +369,21 @@ class GSCubeEncoder(Swin3DUNet):
             )
             if self.cube_merge_type == 'max':
                 # randomly select one point in each voxel by choosing the max random value
-                rand_val = torch.rand(grid_coords[batch_idx,:,:].size(0), device=device)
+                rand_val = torch.rand(grid_coords_batch.size(0), device=device)
                 _, selected_ind = scatter_max(
                     rand_val,
                     inverse_ind,
                     dim=0,
                     dim_size=unique_coords.shape[0]
                     )
-                unique_grid_coords = grid_coords[batch_idx,selected_ind,:]
-                feats_unique = feats[batch_idx, selected_ind, :]
-                imgs_unique = imgs[batch_idx, selected_ind, :]
-                positions = xyz_scaled[batch_idx, selected_ind, :]
+                unique_grid_coords = grid_coords_batch[selected_ind,:]
+                feats_unique = feats_batch[selected_ind, :]
+                imgs_unique = imgs_batch[selected_ind, :]
+                positions = xyz_scaled_batch[selected_ind, :]
             elif self.cube_merge_type == 'sum':
-                feats_conf = feats*conf
+                feats_conf = feats_batch*conf_batch_full
                 feats_unique = scatter_add(
-                    feats_conf[batch_idx,:,:], 
+                    feats_conf, 
                     inverse_ind, 
                     dim=0, 
                     dim_size=unique_coords.shape[0]
@@ -326,12 +391,12 @@ class GSCubeEncoder(Swin3DUNet):
                 # index of first occureence
                 selected_ind = scatter_min(torch.arange(inverse_ind.shape[0], device=inverse_ind.device), inverse_ind)[1]
                 unique_grid_coords = unique_coords
-                imgs_unique = imgs[batch_idx, selected_ind, :]
-                positions = xyz_scaled[batch_idx, selected_ind, :]
+                imgs_unique = imgs_batch[selected_ind, :]
+                positions = xyz_scaled_batch[selected_ind, :]
             elif self.cube_merge_type == 'mean':
-                feats_conf = feats*conf
+                feats_conf = feats_batch*conf_batch_full
                 feats_unique = scatter_add(
-                    feats_conf[batch_idx,:,:], 
+                    feats_conf, 
                     inverse_ind, 
                     dim=0, 
                     dim_size=unique_coords.shape[0]
@@ -339,20 +404,20 @@ class GSCubeEncoder(Swin3DUNet):
                 selected_ind = scatter_min(torch.arange(inverse_ind.shape[0], device=inverse_ind.device), inverse_ind)[1]
                 feats_unique = feats_unique / counts[:, None]
                 unique_grid_coords = unique_coords
-                imgs_unique = imgs[batch_idx, selected_ind, :]
-                positions = xyz_scaled[batch_idx, selected_ind, :]
+                imgs_unique = imgs_batch[selected_ind, :]
+                positions = xyz_scaled_batch[selected_ind, :]
                 # views = view_ind[batch_idx, selected_ind, :]
             elif self.cube_merge_type == 'max_conf':
                 _, selected_ind = scatter_max(
-                    conf[batch_idx,:,0],
+                    conf_batch_full[:,0],
                     inverse_ind,
                     dim=0,
                     dim_size=unique_coords.shape[0]
                     )
-                unique_grid_coords = grid_coords[batch_idx,selected_ind,:]
-                feats_unique = feats[batch_idx, selected_ind, :]
-                imgs_unique = imgs[batch_idx, selected_ind, :]
-                positions = xyz_scaled[batch_idx, selected_ind, :]
+                unique_grid_coords = grid_coords_batch[selected_ind,:]
+                feats_unique = feats_batch[selected_ind, :]
+                imgs_unique = imgs_batch[selected_ind, :]
+                positions = xyz_scaled_batch[selected_ind, :]
 
             # concatenate the batch index with coords
             coords_centers = torch.cat([torch.full((unique_grid_coords.shape[0], 1), batch_idx).to(device), unique_grid_coords], dim=-1)  # Nx4

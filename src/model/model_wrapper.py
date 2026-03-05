@@ -101,6 +101,7 @@ class TrainCfg:
     forward_depth_only: bool
     train_ignore_large_loss: float
     no_log_projections: bool
+    video_viz_interval_steps: int
 
 
 @runtime_checkable
@@ -196,6 +197,40 @@ class ModelWrapper(LightningModule):
             self.test_step_output_dict = {}
             self.all_ind = {}
 
+        self._first_eval_visual_logged = False
+
+    def _log_image_all(
+        self,
+        key: str,
+        images: list,
+        step: int,
+        caption=None,
+    ) -> None:
+        if self.global_rank != 0:
+            return
+
+        kwargs = {}
+        if caption is not None:
+            kwargs["caption"] = caption
+
+        if self.logger is not None and hasattr(self.logger, "log_image"):
+            self.logger.log_image(key, images, step=step, **kwargs)
+
+        if isinstance(self.logger, LocalLogger):
+            return
+
+        for index, image in enumerate(images):
+            path = LOG_PATH / f"{key}/{index:0>2}_{step:0>6}.png"
+            path.parent.mkdir(exist_ok=True, parents=True)
+            if isinstance(image, torch.Tensor):
+                out = image.detach().cpu()
+                if out.dim() == 3 and out.shape[0] in (1, 3):
+                    out = out.permute(1, 2, 0)
+                out = out.numpy().astype(np.uint8)
+                PILImage.fromarray(out).save(path)
+            else:
+                PILImage.fromarray(np.asarray(image).astype(np.uint8)).save(path)
+
 
     def _handle_oom(self, where: str):
         # free up as much as we can so the next batch can proceed
@@ -203,6 +238,50 @@ class ModelWrapper(LightningModule):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
+
+    # ---- backward profiling hooks for voxel path diagnosis ----
+    def on_before_backward(self, loss):
+        if hasattr(self.encoder, 'cfg') and getattr(self.encoder.cfg, 'profile_voxelization', False):
+            import time as _time
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            self._bwd_start_time = _time.perf_counter()
+            self._bwd_fwd_peak = torch.cuda.max_memory_allocated() / (1024**3)
+
+    def on_after_backward(self):
+        if hasattr(self.encoder, 'cfg') and getattr(self.encoder.cfg, 'profile_voxelization', False):
+            import time as _time
+            torch.cuda.synchronize()
+            bwd_time = _time.perf_counter() - getattr(self, '_bwd_start_time', _time.perf_counter())
+            bwd_peak = torch.cuda.max_memory_allocated() / (1024**3)
+            bwd_alloc = torch.cuda.memory_allocated() / (1024**3)
+            # Collect backward hook stats from sub-modules
+            bwd_stats = getattr(self.encoder, '_bwd_profile_stats', {})
+            bwd_start = getattr(self, '_bwd_start_time', 0)
+            # Print backward report
+            if not getattr(self, '_bwd_profile_reported', False):
+                msg = [
+                    "\n[mono-voxel-profile] === BACKWARD PASS ===",
+                    f"  total_backward:   {bwd_time:.4f}s  peak_bwd_mem={bwd_peak:.2f}GB  alloc_after={bwd_alloc:.2f}GB",
+                ]
+                # Per-module backward timing (hooks fire in backward order: dense_adapter → gs_cube → depth_predictor)
+                prev_end = bwd_start
+                for name in ['dense_adapter', 'gs_cube', 'depth_predictor']:
+                    end_t = bwd_stats.get(f'{name}_bwd_end', None)
+                    alloc = bwd_stats.get(f'{name}_bwd_alloc', 0.0)
+                    peak = bwd_stats.get(f'{name}_bwd_peak', 0.0)
+                    if end_t is not None:
+                        dur = end_t - prev_end
+                        msg.append(f"  {name:20s} bwd_time={dur:.4f}s  alloc={alloc:.2f}GB  peak={peak:.2f}GB")
+                        prev_end = end_t
+                # Time after last hook to end of backward (optimizer/grad)
+                if prev_end > bwd_start:
+                    remainder = bwd_time - (prev_end - bwd_start)
+                    msg.append(f"  {'decoder+loss_bwd':20s} (remainder)={remainder:.4f}s")
+                msg.append(f"\n[mono-voxel-profile] === GPU MEMORY SUMMARY ===")
+                msg.append(torch.cuda.memory_summary(abbreviated=True))
+                print("\n".join(msg))
+                self._bwd_profile_reported = True
 
     def training_step(self, batch, batch_idx):
         # batch = torch.load("/data2/xxy/code/depthsplat/offending_batch.pt")
@@ -957,7 +1036,16 @@ class ModelWrapper(LightningModule):
         # Render Gaussians.
         b, _, _, h, w = batch["target"]["image"].shape
         assert b == 1
-        if self.global_step % save_interval == 0 and self.global_rank == 0 and batch_idx==0:
+        should_log_eval_visuals = (
+            self.global_rank == 0
+            and batch_idx == 0
+            and (
+                (not self._first_eval_visual_logged and not self.trainer.sanity_checking)
+                or self.global_step % save_interval == 0
+            )
+        )
+
+        if should_log_eval_visuals:
             visualization_dump = {}
             gaussians_softmax = self.encoder(
                 batch["context"],
@@ -1071,7 +1159,7 @@ class ModelWrapper(LightningModule):
                     (concat_img.cpu().detach(), depth_viz), dim=1
                 )  # [3, H*2, W*N]
 
-            self.logger.log_image(
+            self._log_image_all(
                 "depth",
                 [concat],
                 step=self.global_step,
@@ -1085,7 +1173,7 @@ class ModelWrapper(LightningModule):
                 add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
                 add_label(vcat(*rgb_softmax), "Target (Prediction)"),
             )
-            self.logger.log_image(
+            self._log_image_all(
                 "comparison",
                 [prep_image(add_border(comparison))],
                 step=self.global_step,
@@ -1103,7 +1191,7 @@ class ModelWrapper(LightningModule):
                         extra_label="(Prediction)",
                     )[0]
                 )
-                self.logger.log_image(
+                self._log_image_all(
                     "projection",
                     [prep_image(add_border(projections))],
                     step=self.global_step,
@@ -1111,7 +1199,7 @@ class ModelWrapper(LightningModule):
 
                 # Draw cameras.
                 cameras = hcat(*render_cameras(batch, 256))
-                self.logger.log_image(
+                self._log_image_all(
                     "cameras", [prep_image(add_border(cameras))], step=self.global_step
                 )
 
@@ -1119,22 +1207,34 @@ class ModelWrapper(LightningModule):
                 for k, image in self.encoder_visualizer.visualize(
                     batch["context"], self.global_step
                 ).items():
-                    self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+                    self._log_image_all(k, [prep_image(image)], step=self.global_step)
 
             # Run video validation step.
-            if not self.train_cfg.no_viz_video:
+            video_viz_interval = max(int(self.train_cfg.video_viz_interval_steps), 1)
+            if (
+                self.global_step > 0
+                and self.global_step % video_viz_interval == 0
+            ):
                 self.render_video_interpolation(batch, vggt_meta=self.vggt_meta)
                 self.render_video_wobble(batch, vggt_meta=self.vggt_meta)
                 if self.train_cfg.extended_visualization:
                     self.render_video_interpolation_exaggerated(batch, vggt_meta=self.vggt_meta)
 
-        if self.global_step % save_interval == 0 and self.global_rank == 0 and batch_idx==0:
+        if should_log_eval_visuals and (not self.trainer.sanity_checking):
             if self.gs_cube:
                 print(f"Saving Gaussian cube at step {self.global_step}...")
                 scene = batch["scene"][0]
                 save_path = Path(get_cfg()['output_dir']) / 'gaussians_cube' / (scene + f'_{self.global_step}' + '.ply')
                 save_gaussian_cube_ply(gaussians_softmax, visualization_dump, batch, save_path)
                 visualization_dump = None
+            elif 'visualization_dump' in locals():
+                print(f"Saving Gaussian splats at step {self.global_step}...")
+                scene = batch["scene"][0]
+                save_path = Path(get_cfg()['output_dir']) / 'gaussians' / (scene + f'_{self.global_step}' + '.ply')
+                save_gaussian_ply(gaussians_softmax, visualization_dump, batch, save_path)
+                visualization_dump = None
+            if not self.trainer.sanity_checking:
+                self._first_eval_visual_logged = True
         torch.cuda.empty_cache()
 
     def on_validation_epoch_end(self) -> None:

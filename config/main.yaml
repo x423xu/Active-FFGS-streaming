@@ -68,6 +68,7 @@ train:
   forward_depth_only: false
   train_ignore_large_loss: 0.
   no_log_projections: false
+  video_viz_interval_steps: 5000
 
 test:
   output_path: outputs/test
