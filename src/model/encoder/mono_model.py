@@ -19,6 +19,9 @@ from .gs_cube import GSCubeEncoder
 from .mono.depth_predictor_multiview import DepthPredictorMultiView
 from .mono.gaussian_adapter_mono import MonoGaussianAdapter
 
+TIMER = True
+if TIMER:
+    import time
 
 @dataclass
 class OpacityMappingCfg:
@@ -301,32 +304,10 @@ class MonoModel(Encoder[MonoModelCfg]):
     ) -> Gaussians | dict:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
-        profile_stats = {
-            "depth_predictor": 0.0,
-            "base_gaussian": 0.0,
-            "voxel_prep": 0.0,
-            "gs_cube": 0.0,
-            "dense_adapter": 0.0,
-            "peak_depth": 0.0,
-            "peak_2d": 0.0,
-            "peak_prep": 0.0,
-            "peak_cube": 0.0,
-            "peak_dense": 0.0,
-        }
-        if self.cfg.profile_voxelization and device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-            # Enable gs_cube sub-stage profiling
-            GSCubeEncoder._cube_profile_stats = {}
-            # Install backward hooks for backward-pass measurement
-            if self.enable_voxelization and not self._bwd_hooks:
-                self._install_backward_hooks()
+        
 
         gpp = self.cfg.gaussians_per_pixel
-        if self.cfg.profile_voxelization and device.type == "cuda":
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-        t0 = time.perf_counter()
-        if self.enable_voxelization and (not self.cfg.voxel_train_depth_predictor):
+        if self.enable_voxelization:
             with torch.no_grad():
                 predictor_output = self.depth_predictor(
                     context["image"],
@@ -340,6 +321,8 @@ class MonoModel(Encoder[MonoModelCfg]):
                     skip_2d_gaussian_head=self.enable_voxelization and (not self.cfg.voxel_compute_2d_branch),
                 )
         else:
+            if TIMER:
+                start_time = time.time()
             predictor_output = self.depth_predictor(
                 context["image"],
                 context["intrinsics"],
@@ -351,11 +334,9 @@ class MonoModel(Encoder[MonoModelCfg]):
                 return_aux=self.enable_voxelization,
                 skip_2d_gaussian_head=self.enable_voxelization and (not self.cfg.voxel_compute_2d_branch),
             )
-        if self.cfg.profile_voxelization and device.type == "cuda":
-            torch.cuda.synchronize(device)
-            profile_stats["peak_depth"] = self._profile_peak_gb(device)
-            profile_stats["alloc_after_depth"] = torch.cuda.memory_allocated(device) / (1024**3)
-        profile_stats["depth_predictor"] = time.perf_counter() - t0
+            if TIMER:
+                elapsed = time.time() - start_time
+                print(f'***** Depth predictor time: {elapsed:.4f}s')
         if self.enable_voxelization:
             depths, densities, raw_gaussians, aux_dict = predictor_output
         else:
@@ -363,10 +344,6 @@ class MonoModel(Encoder[MonoModelCfg]):
 
         if self.enable_voxelization:
             if self.cfg.voxel_compute_2d_branch:
-                if self.cfg.profile_voxelization and device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                    torch.cuda.reset_peak_memory_stats(device)
-                t0 = time.perf_counter()
                 _ = self._build_2d_gaussians(
                     context,
                     depths,
@@ -378,15 +355,7 @@ class MonoModel(Encoder[MonoModelCfg]):
                     device,
                     global_step,
                 )
-                if self.cfg.profile_voxelization and device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                    profile_stats["peak_2d"] = self._profile_peak_gb(device)
-                profile_stats["base_gaussian"] = time.perf_counter() - t0
 
-            if self.cfg.profile_voxelization and device.type == "cuda":
-                torch.cuda.synchronize(device)
-                torch.cuda.reset_peak_memory_stats(device)
-            t0 = time.perf_counter()
             depth_map = rearrange(depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w).squeeze(-1).squeeze(-1)
             voxel_features = rearrange(aux_dict["voxel_features"], "(b v) c h w -> b v c h w", b=b, v=v)
             confidence_map = rearrange(aux_dict["confidence_map"], "(b v) c h w -> b v c h w", b=b, v=v)
@@ -448,16 +417,7 @@ class MonoModel(Encoder[MonoModelCfg]):
                     "extrinsics": context["extrinsics"],
                 })
                 voxel_features = torch.cat([voxel_features, plucker_embed], dim=2)
-            if self.cfg.profile_voxelization and device.type == "cuda":
-                torch.cuda.synchronize(device)
-                profile_stats["peak_prep"] = self._profile_peak_gb(device)
-                profile_stats["alloc_after_prep"] = torch.cuda.memory_allocated(device) / (1024**3)
-            profile_stats["voxel_prep"] = time.perf_counter() - t0
 
-            if self.cfg.profile_voxelization and device.type == "cuda":
-                torch.cuda.synchronize(device)
-                torch.cuda.reset_peak_memory_stats(device)
-            t0 = time.perf_counter()
             gs_cube, coords_sp, input_cube_tensor, _, _, _ = self.gs_cube_encoder(
                 image_for_voxel,
                 depth_map,
@@ -474,11 +434,6 @@ class MonoModel(Encoder[MonoModelCfg]):
                 max_points_per_batch=self.cfg.voxel_max_points_per_batch,
                 conf_threshold=self.cfg.voxel_conf_threshold,
             )
-            if self.cfg.profile_voxelization and device.type == "cuda":
-                torch.cuda.synchronize(device)
-                profile_stats["peak_cube"] = self._profile_peak_gb(device)
-                profile_stats["alloc_after_cube"] = torch.cuda.memory_allocated(device) / (1024**3)
-            profile_stats["gs_cube"] = time.perf_counter() - t0
             cube_feat = rearrange(gs_cube.F, "n (c gpc) -> n c gpc", gpc=self.gpc)
             cube_opacities = cube_feat[:, :1].sigmoid()
             offset_xyz = cube_feat[:, 1:4].sigmoid()
@@ -506,12 +461,7 @@ class MonoModel(Encoder[MonoModelCfg]):
                 input_images=rgbs,
                 gpc=self.gpc,
             )
-            if self.cfg.profile_voxelization and device.type == "cuda":
-                torch.cuda.synchronize(device)
-                profile_stats["peak_dense"] = self._profile_peak_gb(device)
-                profile_stats["alloc_after_dense"] = torch.cuda.memory_allocated(device) / (1024**3)
-            profile_stats["dense_adapter"] = time.perf_counter() - t0
-            self._log_profile(profile_stats, device)
+
             if visualization_dump is not None:
                 visualization_dump["voxel_confidence"] = rearrange(confidence_map, "b v c h w -> b v h w c")
                 visualization_dump["depth"] = rearrange(depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w)
@@ -533,9 +483,8 @@ class MonoModel(Encoder[MonoModelCfg]):
                 }
             return out_gaussians
 
-        if self.cfg.profile_voxelization and device.type == "cuda":
-            torch.cuda.synchronize(device)
-        t0 = time.perf_counter()
+        if TIMER:
+            start_time = time.time()
         gaussians = self._build_2d_gaussians(
             context,
             depths,
@@ -547,11 +496,9 @@ class MonoModel(Encoder[MonoModelCfg]):
             device,
             global_step,
         )
-        if self.cfg.profile_voxelization and device.type == "cuda":
-            torch.cuda.synchronize(device)
-        profile_stats["base_gaussian"] = time.perf_counter() - t0
-        self._log_profile(profile_stats, device)
-
+        if TIMER:
+            elapsed = time.time() - start_time
+            print(f'***** gaussian adapter time: {elapsed:.4f}s')
         if visualization_dump is not None:
             visualization_dump["depth"] = rearrange(
                 depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w

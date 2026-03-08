@@ -11,6 +11,14 @@ from .mv_transformer import (
 )
 from .utils import mv_feature_add_position
 
+TIMER=True
+if TIMER:
+    import time
+    def _sync_time(device: torch.device) -> float:
+        # CUDA ops are asynchronous; synchronize so stage timings are attributed correctly.
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.time()
 
 def coords_grid(batch, ht, wd, homogeneous=False, device=None):
     ys, xs = torch.meshgrid(
@@ -126,6 +134,115 @@ def prepare_feat_proj_data_lists(features, intrinsics, extrinsics, num_reference
     return feat_warp, intr_warp, poses_warp
 
 
+class DepthwiseSeparableConv(nn.Module):
+    """Depthwise 3x3 + pointwise 1x1, ~8x fewer FLOPs than standard 3x3 conv."""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding, groups=in_channels, bias=False)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1)
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
+
+class LiteResBlock(nn.Module):
+    """Residual block using depthwise-separable convolutions."""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = DepthwiseSeparableConv(in_channels, out_channels)
+        self.norm1 = nn.GroupNorm(8, out_channels)
+        self.conv2 = DepthwiseSeparableConv(out_channels, out_channels)
+        self.norm2 = nn.GroupNorm(8, out_channels)
+        self.act = nn.GELU()
+        self.skip = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x):
+        h = self.act(self.norm1(self.conv1(x)))
+        h = self.norm2(self.conv2(h))
+        return self.act(h + self.skip(x))
+
+
+class EfficientCrossViewAttn(nn.Module):
+    """Per-pixel cross-view attention: O(V^2 * HW) instead of O((V*HW)^2).
+    For V=2, the attention matrix is 2x2 per pixel — essentially free."""
+    def __init__(self, channels, num_views=2, num_heads=4):
+        super().__init__()
+        self.num_views = num_views
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x):
+        bv, c, h, w = x.shape
+        v = self.num_views
+        residual = x
+        x = self.norm(x)
+        qkv = self.qkv(x)
+        qkv = rearrange(qkv, '(b v) (three nh hd) h w -> three b nh (h w) v hd',
+                         v=v, three=3, nh=self.num_heads, hd=self.head_dim)
+        q, k, val = qkv.unbind(0)
+        attn = (q @ k.transpose(-1, -2)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = attn @ val
+        out = rearrange(out, 'b nh (h w) v hd -> (b v) (nh hd) h w', h=h, w=w)
+        return residual + self.proj(out)
+
+
+class LiteCostVolumeRefineNet(nn.Module):
+    """Lightweight cost volume refinement replacing the heavy UNetModel version.
+
+    Key speedups:
+    - Depthwise-separable convs in ResBlocks (~8x fewer FLOPs per conv)
+    - Per-pixel cross-view attention at bottleneck (O(V^2*HW) vs O((V*HW)^2))
+    - ~4.5x fewer total parameters than original UNetModel-based refinement
+    """
+    def __init__(self, in_channels, feat_dim, out_channels, num_views=2):
+        super().__init__()
+        # Input projection (standard conv to mix heterogeneous input channels)
+        self.proj_in = nn.Sequential(
+            nn.Conv2d(in_channels, feat_dim, 3, 1, 1),
+            nn.GroupNorm(8, feat_dim),
+            nn.GELU(),
+        )
+        # Encoder
+        self.enc0 = LiteResBlock(feat_dim, feat_dim)            # 64x64
+        self.down0 = nn.Conv2d(feat_dim, feat_dim, 3, 2, 1)    # -> 32x32
+        self.enc1 = LiteResBlock(feat_dim, feat_dim)            # 32x32
+        self.down1 = nn.Conv2d(feat_dim, feat_dim, 3, 2, 1)    # -> 16x16
+        # Bottleneck with cross-view attention
+        self.mid = LiteResBlock(feat_dim, feat_dim)
+        self.cross_view = EfficientCrossViewAttn(feat_dim, num_views)
+        # Decoder
+        self.up1 = nn.Sequential(nn.Upsample(scale_factor=2, mode='nearest'),
+                                 nn.Conv2d(feat_dim, feat_dim, 3, 1, 1))
+        self.dec1 = LiteResBlock(feat_dim * 2, feat_dim)        # skip-cat -> 32x32
+        self.up0 = nn.Sequential(nn.Upsample(scale_factor=2, mode='nearest'),
+                                 nn.Conv2d(feat_dim, feat_dim, 3, 1, 1))
+        self.dec0 = LiteResBlock(feat_dim * 2, feat_dim)        # skip-cat -> 64x64
+        # Output projection (zero-init so initial output relies on residual skip)
+        self.proj_out = nn.Conv2d(feat_dim, out_channels, 3, 1, 1)
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, x):
+        h = self.proj_in(x)
+        # Encoder
+        h0 = self.enc0(h)                                       # 64x64
+        h1 = self.enc1(self.down0(h0))                          # 32x32
+        # Bottleneck
+        h = self.mid(self.down1(h1))                             # 16x16
+        h = self.cross_view(h)
+        # Decoder with skip connections
+        h = self.dec1(torch.cat([self.up1(h), h1], dim=1))      # 32x32
+        h = self.dec0(torch.cat([self.up0(h), h0], dim=1))      # 64x64
+        return self.proj_out(h)
+
+
 class DepthPredictorMultiView(nn.Module):
     """IMPORTANT: this model is in (v b), NOT (b v), due to some historical issues.
     keep this in mind when performing any operation related to the view dim"""
@@ -193,29 +310,35 @@ class DepthPredictorMultiView(nn.Module):
             ffn_dim_expansion=ffn_dim_expansion,
         )
         
-        # Cost volume refinement
+        # Cost volume refinement (lightweight version)
         input_channels = num_depth_candidates + feature_channels * 2
         channels = self.regressor_feat_dim
-        self.corr_refine_net = nn.Sequential(
-            nn.Conv2d(input_channels, channels, 3, 1, 1),
-            nn.GroupNorm(8, channels),
-            nn.GELU(),
-            UNetModel(
-                image_size=None,
-                in_channels=channels,
-                model_channels=channels,
-                out_channels=channels,
-                num_res_blocks=1,
-                attention_resolutions=costvolume_unet_attn_res,
-                channel_mult=costvolume_unet_channel_mult,
-                num_head_channels=32,
-                dims=2,
-                postnorm=True,
-                num_frames=num_views,
-                use_cross_view_self_attn=True,
-            ),
-            nn.Conv2d(channels, num_depth_candidates, 3, 1, 1))
-            # cost volume u-net skip connection
+        self.corr_refine_net = LiteCostVolumeRefineNet(
+            in_channels=input_channels,
+            feat_dim=channels,
+            out_channels=num_depth_candidates,
+            num_views=num_views,
+        )
+        # self.corr_refine_net = nn.Sequential(
+        #     nn.Conv2d(input_channels, channels, 3, 1, 1),
+        #     nn.GroupNorm(8, channels),
+        #     nn.GELU(),
+        #     UNetModel(
+        #         image_size=None,
+        #         in_channels=channels,
+        #         model_channels=channels,
+        #         out_channels=channels,
+        #         num_res_blocks=1,
+        #         attention_resolutions=costvolume_unet_attn_res,
+        #         channel_mult=costvolume_unet_channel_mult,
+        #         num_head_channels=32,
+        #         dims=2,
+        #         postnorm=True,
+        #         num_frames=num_views,
+        #         use_cross_view_self_attn=True,
+        #     ),
+        #     nn.Conv2d(channels, num_depth_candidates, 3, 1, 1))
+        # cost volume u-net skip connection
         self.regressor_residual = nn.Conv2d(input_channels, num_depth_candidates, 1, 1, 0)
 
         # Depth estimation: project features to get softmax based coarse depth
@@ -295,6 +418,7 @@ class DepthPredictorMultiView(nn.Module):
         std = torch.tensor([0.229, 0.224, 0.225]).reshape(*shape).to(images.device)
 
         return (images - mean) / std
+
     
     def forward(
         self,
@@ -308,7 +432,10 @@ class DepthPredictorMultiView(nn.Module):
         return_aux: bool = False,
         skip_2d_gaussian_head: bool = False,
     ):
-
+        device = extrinsics.device
+        if TIMER:
+            total_start = _sync_time(device)
+            vit_start = _sync_time(device)
         num_reference_views = 1
         # find nearest idxs
         cam_origins = extrinsics[:, :, :3, -1]  # [b, v, 3]
@@ -326,10 +453,12 @@ class DepthPredictorMultiView(nn.Module):
         features = self.pretrained.get_intermediate_layers(concat, 
                                                            self.intermediate_layer_idx[self.vit_type], 
                                                            return_class_token=True)
+        if TIMER:
+            vit_elapsed = _sync_time(device) - vit_start
+            adapter_start = _sync_time(device)
         # new decoder
         features_mono, disps_rel = self.depth_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
         features_mv = self.cost_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
-        
         features_mv = F.interpolate(features_mv, (64, 64), mode="bilinear", align_corners=True)
         features_mv = mv_feature_add_position(features_mv, 2, 64)
         features_mv_list = list(torch.unbind(rearrange(features_mv, "(b v) c h w -> b v c h w", b=b, v=v), dim=1))
@@ -339,7 +468,9 @@ class DepthPredictorMultiView(nn.Module):
             nn_matrix=idx,
         )
         features_mv = rearrange(torch.stack(features_mv_list, dim=1), "b v c h w -> (b v) c h w")  # [BV, C, H, W]
-        
+        if TIMER:
+            adapter_elapsed = _sync_time(device) - adapter_start
+            cost_volume_start = _sync_time(device)
         # cost volume construction
         features_mv_warped, intr_warped, poses_warped = (
             prepare_feat_proj_data_lists(
@@ -368,10 +499,14 @@ class DepthPredictorMultiView(nn.Module):
             raw_correlation_in.append(raw_correlation_in_i)
         raw_correlation_in = torch.mean(torch.stack(raw_correlation_in, dim=1), dim=1)  # [B*V, D, H, W]
         
+        if TIMER:
+            cost_volume_elapsed = _sync_time(device) - cost_volume_start
+            depth_refine_start = _sync_time(device)
+
         # refine cost volume and get depths
         features_mono_tmp = F.interpolate(features_mono, (64, 64), mode="bilinear", align_corners=True)
         raw_correlation_in = torch.cat((raw_correlation_in, features_mv, features_mono_tmp), dim=1)
-        raw_correlation = cp.checkpoint(self.corr_refine_net, raw_correlation_in, use_reentrant=False)
+        raw_correlation = self.corr_refine_net(raw_correlation_in)
         raw_correlation = raw_correlation + self.regressor_residual(raw_correlation_in)
         pdf = F.softmax(self.depth_head_lowres(raw_correlation), dim=1)
         disps_metric = (disp_candi_curr * pdf).sum(dim=1, keepdim=True) 
@@ -379,7 +514,11 @@ class DepthPredictorMultiView(nn.Module):
         pdf_max = F.interpolate(pdf_max, (ori_h, ori_w), mode="bilinear", align_corners=True)
         disps_metric_fullres = F.interpolate(disps_metric, (ori_h, ori_w), mode="bilinear", align_corners=True)
 
-        # feature refinement
+        if TIMER:
+            depth_refine_elapsed = _sync_time(device) - depth_refine_start
+            feature_refine_start = _sync_time(device)
+
+
         features_mv_in_fullres = F.interpolate(features_mv, (ori_h, ori_w), mode="bilinear", align_corners=True)
         features_mv_in_fullres = self.proj_feature_mv(features_mv_in_fullres)
         features_mono_in_fullres = F.interpolate(features_mono, (ori_h, ori_w), mode="bilinear", align_corners=True)
@@ -389,7 +528,7 @@ class DepthPredictorMultiView(nn.Module):
         images_reorder = rearrange(images, "b v c h w -> (b v) c h w")
         refine_input = torch.cat((features_mv_in_fullres, features_mono_in_fullres, images_reorder, \
                 disps_metric_fullres, disps_rel_fullres, pdf_max), 
-                      dim=1)
+                    dim=1)
         refine_out = cp.checkpoint(self.refine_unet, refine_input, use_reentrant=False)
 
         if self.enable_voxel_heads:
@@ -445,5 +584,11 @@ class DepthPredictorMultiView(nn.Module):
                 "confidence_map": confidence_map,
             }
             return depths, densities, raw_gaussians, aux_dict
-
+        if TIMER:
+            feature_refine_elapsed = _sync_time(device) - feature_refine_start
+            total_elapsed = _sync_time(device) - total_start
+            percents = []
+            for t in [vit_elapsed, adapter_elapsed, cost_volume_elapsed, depth_refine_elapsed, feature_refine_elapsed]:
+                percents.append(t / total_elapsed * 100)
+            print(f"Timing (in seconds): \n ViT encoder {vit_elapsed:.3f} {percents[0]:.1f}%, \n adapter {adapter_elapsed:.3f} {percents[1]:.1f}%, \n cost volume {cost_volume_elapsed:.3f} {percents[2]:.1f}%, \n depth refine {depth_refine_elapsed:.3f} {percents[3]:.1f}%, \n feature refine {feature_refine_elapsed:.3f} {percents[4]:.1f}%, \n total {total_elapsed:.3f}")
         return depths, densities, raw_gaussians 

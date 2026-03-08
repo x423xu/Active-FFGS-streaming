@@ -53,6 +53,7 @@ from ..misc.stablize_camera import render_stabilization_path
 from .ply_export import save_gaussian_ply, save_gaussian_cube_ply
 from .types import Gaussians
 
+import time
 
 DEBUG = False
 NOISE=True
@@ -700,7 +701,9 @@ class ModelWrapper(LightningModule):
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
             # batch["context"]["extrinsics"] = batch["context"]["extrinsics"] + 0.01*torch.rand_like(batch["context"]["extrinsics"])
+            encoder_time_start = time.time()
             gaussians = self._batch_forward(batch['context'], visualization_dump=visualization_dump)
+            encoder_time_elapsed = time.time() - encoder_time_start
             # check depth
             # depths_my = gaussians["depths"]  # [1, V, H, W]
             # for nd, depth_i in enumerate(depths_my[0]):
@@ -802,6 +805,7 @@ class ModelWrapper(LightningModule):
                                 )
 
                 else:
+                    decoder_time_start = time.time()
                     output = self.decoder.forward(
                         gaussians,
                         camera_poses,
@@ -812,6 +816,10 @@ class ModelWrapper(LightningModule):
                         depth_mode=None,
                         vggt_meta=self.vggt_meta
                     )
+                    decoder_time_elapsed = time.time() - decoder_time_start
+                    print(f'encoder time: {encoder_time_elapsed:.2f}s, decoder time: {decoder_time_elapsed:.2f}s')
+                    precent_encoder, percent_decoder = encoder_time_elapsed/(encoder_time_elapsed+decoder_time_elapsed), decoder_time_elapsed/(encoder_time_elapsed+decoder_time_elapsed)
+                    print(f'encoder time percent: {precent_encoder:.2%}, decoder time percent: {percent_decoder:.2%}')
 
         (scene,) = batch["scene"]
         self.test_cfg.output_path = os.path.join(get_cfg()["output_dir"], "metrics")
