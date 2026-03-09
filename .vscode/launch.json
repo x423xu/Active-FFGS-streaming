@@ -153,7 +153,15 @@
                 "data_loader.test.persistent_workers=false",
                 "data_loader.test.batch_size=1",
                 "dataset.test_len=10",
-                "checkpointing.no_strict_load=true"
+                "checkpointing.no_strict_load=true",
+                "model.encoder.enable_voxelization=true",
+                "model.encoder.use_plucker_embedding=false",
+                "model.encoder.voxel_train_depth_predictor=true",
+                "model.encoder.voxel_conf_threshold=0.0",
+                "model.encoder.voxel_max_points_per_batch=140000",
+                "model.encoder.voxel_low_vram_arch=true",
+                "model.encoder.voxelization_downsample_factor=1",
+                "model.encoder.profile_voxelization=false"
             ]
         },
     ],

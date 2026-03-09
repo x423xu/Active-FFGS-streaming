@@ -3,7 +3,6 @@ from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
-import time
 from einops import rearrange
 from jaxtyping import Float
 from torch import Tensor
@@ -18,10 +17,6 @@ from .encoder import Encoder
 from .gs_cube import GSCubeEncoder
 from .mono.depth_predictor_multiview import DepthPredictorMultiView
 from .mono.gaussian_adapter_mono import MonoGaussianAdapter
-
-TIMER = True
-if TIMER:
-    import time
 
 @dataclass
 class OpacityMappingCfg:
@@ -131,13 +126,13 @@ class MonoModel(Encoder[MonoModelCfg]):
                 depths=cube_depths,
                 channels=cube_channels,
                 num_heads=cube_heads,
-                window_sizes=[5, 5],
+                window_sizes=[3, 3],
                 num_layers=2,
                 quant_size=4,
                 in_channels=cube_in_channels,
                 down_strides=cfg.down_strides,
-                knn_down=True,
-                upsample='linear_attn',
+                knn_down=False,
+                upsample='linear',
                 cRSE='XYZ_RGB',
                 up_k=3,
                 num_classes=13,
@@ -150,80 +145,6 @@ class MonoModel(Encoder[MonoModelCfg]):
             )
             self.dense_gaussian_adapter = DenseGaussianAdapter(cfg.gaussian_adapter)
             self.gpc = cfg.gaussians_per_cell
-        self._profile_printed = False
-        self._bwd_profile_stats = {}  # filled by backward hooks
-        self._bwd_hooks = []
-
-    def _install_backward_hooks(self):
-        """Install backward hooks on key sub-modules to measure backward time + memory."""
-        import time as _time
-
-        if self._bwd_hooks:
-            return  # already installed
-
-        stats = self._bwd_profile_stats
-        stats.clear()
-
-        def _make_hook(name):
-            def hook(module, grad_input, grad_output):
-                torch.cuda.synchronize()
-                stats[f'{name}_bwd_end'] = _time.perf_counter()
-                stats[f'{name}_bwd_alloc'] = torch.cuda.memory_allocated() / (1024**3)
-                stats[f'{name}_bwd_peak'] = torch.cuda.max_memory_allocated() / (1024**3)
-            return hook
-
-        # The backward order is reverse of forward: dense_adapter → gs_cube → depth_predictor
-        for name, mod in [
-            ('dense_adapter', self.dense_gaussian_adapter),
-            ('gs_cube', self.gs_cube_encoder),
-            ('depth_predictor', self.depth_predictor),
-        ]:
-            h = mod.register_full_backward_hook(_make_hook(name))
-            self._bwd_hooks.append(h)
-
-    def _remove_backward_hooks(self):
-        for h in self._bwd_hooks:
-            h.remove()
-        self._bwd_hooks.clear()
-
-    def _profile_peak_gb(self, device: torch.device) -> float:
-        if device.type != "cuda":
-            return 0.0
-        return torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-
-    def _log_profile(self, stats: dict[str, float], device: torch.device) -> None:
-        if not self.cfg.profile_voxelization:
-            return
-        if self._profile_printed:
-            return
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            if torch.distributed.get_rank() != 0:
-                return
-        max_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-        # Basic forward stats
-        msg = [
-            "\n[mono-voxel-profile] === FORWARD PASS ===",
-            f"  depth_predictor:  {stats.get('depth_predictor', 0.0):.4f}s  peak={stats.get('peak_depth', 0.0):.2f}GB  alloc_after={stats.get('alloc_after_depth', 0.0):.2f}GB",
-            f"  voxel_prep:       {stats.get('voxel_prep', 0.0):.4f}s  peak={stats.get('peak_prep', 0.0):.2f}GB  alloc_after={stats.get('alloc_after_prep', 0.0):.2f}GB",
-            f"  gs_cube(total):   {stats.get('gs_cube', 0.0):.4f}s  peak={stats.get('peak_cube', 0.0):.2f}GB  alloc_after={stats.get('alloc_after_cube', 0.0):.2f}GB",
-        ]
-        # gs_cube sub-stages from GSCubeEncoder._cube_profile_stats
-        cube_stats = GSCubeEncoder._cube_profile_stats
-        if cube_stats:
-            msg.extend([
-                f"    voxelize:       {cube_stats.get('voxelize_time', 0.0):.4f}s  peak={cube_stats.get('voxelize_mem', 0.0):.2f}GB",
-                f"    encode:         {cube_stats.get('encode_time', 0.0):.4f}s  peak={cube_stats.get('encode_mem', 0.0):.2f}GB",
-                f"    decode:         {cube_stats.get('decode_time', 0.0):.4f}s  peak={cube_stats.get('decode_mem', 0.0):.2f}GB",
-                f"    head:           {cube_stats.get('head_time', 0.0):.4f}s  peak={cube_stats.get('head_mem', 0.0):.2f}GB",
-                f"    num_voxels:     {cube_stats.get('num_voxels', 0)}",
-            ])
-        msg.extend([
-            f"  dense_adapter:    {stats.get('dense_adapter', 0.0):.4f}s  peak={stats.get('peak_dense', 0.0):.2f}GB  alloc_after={stats.get('alloc_after_dense', 0.0):.2f}GB",
-            f"  fwd_total_peak:   {max_mem:.2f}GB",
-        ])
-        print("\n".join(msg))
-        self._profile_printed = True
-
     def map_pdf_to_opacity(
         self,
         pdf: Float[Tensor, " *batch"],
@@ -321,8 +242,6 @@ class MonoModel(Encoder[MonoModelCfg]):
                     skip_2d_gaussian_head=self.enable_voxelization and (not self.cfg.voxel_compute_2d_branch),
                 )
         else:
-            if TIMER:
-                start_time = time.time()
             predictor_output = self.depth_predictor(
                 context["image"],
                 context["intrinsics"],
@@ -334,9 +253,6 @@ class MonoModel(Encoder[MonoModelCfg]):
                 return_aux=self.enable_voxelization,
                 skip_2d_gaussian_head=self.enable_voxelization and (not self.cfg.voxel_compute_2d_branch),
             )
-            if TIMER:
-                elapsed = time.time() - start_time
-                print(f'***** Depth predictor time: {elapsed:.4f}s')
         if self.enable_voxelization:
             depths, densities, raw_gaussians, aux_dict = predictor_output
         else:
@@ -448,10 +364,6 @@ class MonoModel(Encoder[MonoModelCfg]):
             coords_xyz = rearrange(xyz_tmp, "n c -> n c ()") + offset
             rgbs = input_cube_tensor.retrieve_rgb_from_batch_coords(gs_cube.C)
             gs_cube = assign_feats(gs_cube, gs_cube.F[:, 4 * self.gpc:])
-            if self.cfg.profile_voxelization and device.type == "cuda":
-                torch.cuda.synchronize(device)
-                torch.cuda.reset_peak_memory_stats(device)
-            t0 = time.perf_counter()
             gaussians = self.dense_gaussian_adapter.forward(
                 context["extrinsics"],
                 context["intrinsics"],
@@ -483,8 +395,6 @@ class MonoModel(Encoder[MonoModelCfg]):
                 }
             return out_gaussians
 
-        if TIMER:
-            start_time = time.time()
         gaussians = self._build_2d_gaussians(
             context,
             depths,
@@ -496,9 +406,6 @@ class MonoModel(Encoder[MonoModelCfg]):
             device,
             global_step,
         )
-        if TIMER:
-            elapsed = time.time() - start_time
-            print(f'***** gaussian adapter time: {elapsed:.4f}s')
         if visualization_dump is not None:
             visualization_dump["depth"] = rearrange(
                 depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w

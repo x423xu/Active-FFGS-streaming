@@ -240,50 +240,6 @@ class ModelWrapper(LightningModule):
             torch.cuda.empty_cache()
         gc.collect()
 
-    # ---- backward profiling hooks for voxel path diagnosis ----
-    def on_before_backward(self, loss):
-        if hasattr(self.encoder, 'cfg') and getattr(self.encoder.cfg, 'profile_voxelization', False):
-            import time as _time
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-            self._bwd_start_time = _time.perf_counter()
-            self._bwd_fwd_peak = torch.cuda.max_memory_allocated() / (1024**3)
-
-    def on_after_backward(self):
-        if hasattr(self.encoder, 'cfg') and getattr(self.encoder.cfg, 'profile_voxelization', False):
-            import time as _time
-            torch.cuda.synchronize()
-            bwd_time = _time.perf_counter() - getattr(self, '_bwd_start_time', _time.perf_counter())
-            bwd_peak = torch.cuda.max_memory_allocated() / (1024**3)
-            bwd_alloc = torch.cuda.memory_allocated() / (1024**3)
-            # Collect backward hook stats from sub-modules
-            bwd_stats = getattr(self.encoder, '_bwd_profile_stats', {})
-            bwd_start = getattr(self, '_bwd_start_time', 0)
-            # Print backward report
-            if not getattr(self, '_bwd_profile_reported', False):
-                msg = [
-                    "\n[mono-voxel-profile] === BACKWARD PASS ===",
-                    f"  total_backward:   {bwd_time:.4f}s  peak_bwd_mem={bwd_peak:.2f}GB  alloc_after={bwd_alloc:.2f}GB",
-                ]
-                # Per-module backward timing (hooks fire in backward order: dense_adapter → gs_cube → depth_predictor)
-                prev_end = bwd_start
-                for name in ['dense_adapter', 'gs_cube', 'depth_predictor']:
-                    end_t = bwd_stats.get(f'{name}_bwd_end', None)
-                    alloc = bwd_stats.get(f'{name}_bwd_alloc', 0.0)
-                    peak = bwd_stats.get(f'{name}_bwd_peak', 0.0)
-                    if end_t is not None:
-                        dur = end_t - prev_end
-                        msg.append(f"  {name:20s} bwd_time={dur:.4f}s  alloc={alloc:.2f}GB  peak={peak:.2f}GB")
-                        prev_end = end_t
-                # Time after last hook to end of backward (optimizer/grad)
-                if prev_end > bwd_start:
-                    remainder = bwd_time - (prev_end - bwd_start)
-                    msg.append(f"  {'decoder+loss_bwd':20s} (remainder)={remainder:.4f}s")
-                msg.append(f"\n[mono-voxel-profile] === GPU MEMORY SUMMARY ===")
-                msg.append(torch.cuda.memory_summary(abbreviated=True))
-                print("\n".join(msg))
-                self._bwd_profile_reported = True
-
     def training_step(self, batch, batch_idx):
         # batch = torch.load("/data2/xxy/code/depthsplat/offending_batch.pt")
         # forward
