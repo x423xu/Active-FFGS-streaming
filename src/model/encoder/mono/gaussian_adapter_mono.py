@@ -10,7 +10,7 @@ from ..common.gaussians import build_covariance
 from ..common.gaussian_adapter import GaussianAdapterCfg
 from ..common.gaussian_adapter import Gaussians
 
-TIMER = True
+TIMER = False
 
 
 def _sync_time(device: torch.device) -> float:

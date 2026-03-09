@@ -11,7 +11,8 @@ from .mv_transformer import (
 )
 from .utils import mv_feature_add_position
 
-TIMER=True
+TIMER=False
+
 if TIMER:
     import time
     def _sync_time(device: torch.device) -> float:
@@ -352,27 +353,14 @@ class DepthPredictorMultiView(nn.Module):
         self.proj_feature_mv = nn.Conv2d(feature_channels, depth_unet_feat_dim, 1, 1)
         self.proj_feature_mono = nn.Conv2d(feature_channels, depth_unet_feat_dim, 1, 1)
 
-        # Depth refinement: 2D U-Net
+        # Depth refinement: lightweight version (same architecture as cost volume refinement)
         input_channels = depth_unet_feat_dim*2 + 3 + 1 + 1 + 1
         channels = depth_unet_feat_dim
-        self.refine_unet = nn.Sequential(
-            nn.Conv2d(input_channels, channels, 3, 1, 1),
-            nn.GroupNorm(4, channels),
-            nn.GELU(),
-            UNetModel(
-                image_size=None,
-                in_channels=channels,
-                model_channels=channels,
-                out_channels=channels,
-                num_res_blocks=1, 
-                attention_resolutions=depth_unet_attn_res,
-                channel_mult=depth_unet_channel_mult,
-                num_head_channels=32,
-                dims=2,
-                postnorm=True,
-                num_frames=num_views,
-                use_cross_view_self_attn=True,
-            ),
+        self.refine_unet = LiteCostVolumeRefineNet(
+            in_channels=input_channels,
+            feat_dim=channels,
+            out_channels=channels,
+            num_views=num_views,
         )
 
         self.enable_voxel_heads = enable_voxel_heads
@@ -461,13 +449,13 @@ class DepthPredictorMultiView(nn.Module):
         features_mv = self.cost_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
         features_mv = F.interpolate(features_mv, (64, 64), mode="bilinear", align_corners=True)
         features_mv = mv_feature_add_position(features_mv, 2, 64)
-        features_mv_list = list(torch.unbind(rearrange(features_mv, "(b v) c h w -> b v c h w", b=b, v=v), dim=1))
-        features_mv_list = self.transformer(
-            features_mv_list,
-            attn_num_splits=2,
-            nn_matrix=idx,
-        )
-        features_mv = rearrange(torch.stack(features_mv_list, dim=1), "b v c h w -> (b v) c h w")  # [BV, C, H, W]
+        # features_mv_list = list(torch.unbind(rearrange(features_mv, "(b v) c h w -> b v c h w", b=b, v=v), dim=1))
+        # features_mv_list = self.transformer(
+        #     features_mv_list,
+        #     attn_num_splits=2,
+        #     nn_matrix=idx,
+        # )
+        # features_mv = rearrange(torch.stack(features_mv_list, dim=1), "b v c h w -> (b v) c h w")  # [BV, C, H, W]
         if TIMER:
             adapter_elapsed = _sync_time(device) - adapter_start
             cost_volume_start = _sync_time(device)
@@ -529,7 +517,7 @@ class DepthPredictorMultiView(nn.Module):
         refine_input = torch.cat((features_mv_in_fullres, features_mono_in_fullres, images_reorder, \
                 disps_metric_fullres, disps_rel_fullres, pdf_max), 
                     dim=1)
-        refine_out = cp.checkpoint(self.refine_unet, refine_input, use_reentrant=False)
+        refine_out = self.refine_unet(refine_input)
 
         if self.enable_voxel_heads:
             latent_world_features = torch.cat(
@@ -575,7 +563,13 @@ class DepthPredictorMultiView(nn.Module):
         if raw_gaussians is not None:
             raw_gaussians = rearrange(raw_gaussians, "(b v) c h w -> b v (h w) c", v=v, b=b)
 
-        
+        if TIMER:
+            feature_refine_elapsed = _sync_time(device) - feature_refine_start
+            total_elapsed = _sync_time(device) - total_start
+            percents = []
+            for t in [vit_elapsed, adapter_elapsed, cost_volume_elapsed, depth_refine_elapsed, feature_refine_elapsed]:
+                percents.append(t / total_elapsed * 100)
+            print(f"Timing (in seconds): \n ViT encoder {vit_elapsed:.3f} {percents[0]:.1f}%, \n adapter {adapter_elapsed:.3f} {percents[1]:.1f}%, \n cost volume {cost_volume_elapsed:.3f} {percents[2]:.1f}%, \n depth refine {depth_refine_elapsed:.3f} {percents[3]:.1f}%, \n feature refine {feature_refine_elapsed:.3f} {percents[4]:.1f}%, \n total {total_elapsed:.3f}")
         if return_aux:
             if not self.enable_voxel_heads:
                 raise RuntimeError("voxel heads are disabled but return_aux=True was requested")
@@ -584,11 +578,5 @@ class DepthPredictorMultiView(nn.Module):
                 "confidence_map": confidence_map,
             }
             return depths, densities, raw_gaussians, aux_dict
-        if TIMER:
-            feature_refine_elapsed = _sync_time(device) - feature_refine_start
-            total_elapsed = _sync_time(device) - total_start
-            percents = []
-            for t in [vit_elapsed, adapter_elapsed, cost_volume_elapsed, depth_refine_elapsed, feature_refine_elapsed]:
-                percents.append(t / total_elapsed * 100)
-            print(f"Timing (in seconds): \n ViT encoder {vit_elapsed:.3f} {percents[0]:.1f}%, \n adapter {adapter_elapsed:.3f} {percents[1]:.1f}%, \n cost volume {cost_volume_elapsed:.3f} {percents[2]:.1f}%, \n depth refine {depth_refine_elapsed:.3f} {percents[3]:.1f}%, \n feature refine {feature_refine_elapsed:.3f} {percents[4]:.1f}%, \n total {total_elapsed:.3f}")
+        
         return depths, densities, raw_gaussians 

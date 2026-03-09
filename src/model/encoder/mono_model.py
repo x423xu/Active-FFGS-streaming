@@ -103,14 +103,7 @@ class MonoModel(Encoder[MonoModelCfg]):
         self.train_depth_predictor = bool(cfg.voxel_train_depth_predictor)
         for param in self.depth_predictor.parameters():
             param.requires_grad = self.train_depth_predictor
-        # Re-freeze DINOv2 backbone + depth_head: the blanket requires_grad above
-        # accidentally unfreezes them; these pretrained modules should stay frozen
-        # to avoid wasting VRAM on their huge backward activations.
-        if self.train_depth_predictor:
-            for param in self.depth_predictor.pretrained.parameters():
-                param.requires_grad = False
-            for param in self.depth_predictor.depth_head.parameters():
-                param.requires_grad = False
+
         if self.enable_voxelization:
             cube_in_channels = cfg.voxel_feature_dim + (6 if self.use_plucker_embedding else 0)
             num_gaussian_parameters = self.gaussian_adapter.d_in + 2 + 1
@@ -229,19 +222,6 @@ class MonoModel(Encoder[MonoModelCfg]):
 
         gpp = self.cfg.gaussians_per_pixel
         if self.enable_voxelization:
-            with torch.no_grad():
-                predictor_output = self.depth_predictor(
-                    context["image"],
-                    context["intrinsics"],
-                    context["extrinsics"],
-                    context["near"],
-                    context["far"],
-                    gaussians_per_pixel=gpp,
-                    deterministic=deterministic,
-                    return_aux=self.enable_voxelization,
-                    skip_2d_gaussian_head=self.enable_voxelization and (not self.cfg.voxel_compute_2d_branch),
-                )
-        else:
             predictor_output = self.depth_predictor(
                 context["image"],
                 context["intrinsics"],

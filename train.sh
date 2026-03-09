@@ -127,3 +127,21 @@ CUDA_VISIBLE_DEVICES=8 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True conda ru
     trainer.max_steps=100000 \
     output_dir=checkpoints/mono_voxel
 
+# lightning mono model
+CUDA_VISIBLE_DEVICES=7 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True conda run -p /data0/xxy/conda_envs/depthsplat --no-capture-output python -m src.main \
+    +experiment=re10k \
+    mode=train \
+    model/encoder=mono_model \
+    dataset.roots=[/data0/xxy/data/re10k] \
+    data_loader.train.batch_size=2 \
+    dataset.min_views=2 \
+    dataset.max_views=2 \
+    model.encoder.profile_voxelization=false \
+    train.video_viz_interval_steps=1000 \
+    trainer.max_steps=300000 \
+    output_dir=checkpoints/mono_voxel_lite \
+    dataset.test_chunk_interval=10 \
+    dataset.image_shape=[256,256] \
+    checkpointing.pretrained_model=pretrained_weights/epoch_9-step_300000.ckpt \
+    checkpointing.no_strict_load=true
+

@@ -9,8 +9,8 @@ from .visualization.encoder_visualizer import EncoderVisualizer
 from .visualization.encoder_visualizer_depthsplat import EncoderVisualizerDepthSplat
 
 ENCODERS = {
-    "efficient_encoder":(EfficientEncoder, None),
-    "mono_model": (MonoModel, None),
+    "efficient_encoder":(EfficientEncoder, EncoderVisualizerDepthSplat),
+    "mono_model": (MonoModel, EncoderVisualizerDepthSplat),
     "depthsplat": (EncoderDepthSplat, EncoderVisualizerDepthSplat),
     "voxelsplat": (EncoderVoxelSplat, EncoderVisualizerDepthSplat),
 }

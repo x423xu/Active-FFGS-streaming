@@ -657,9 +657,7 @@ class ModelWrapper(LightningModule):
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
             # batch["context"]["extrinsics"] = batch["context"]["extrinsics"] + 0.01*torch.rand_like(batch["context"]["extrinsics"])
-            encoder_time_start = time.time()
             gaussians = self._batch_forward(batch['context'], visualization_dump=visualization_dump)
-            encoder_time_elapsed = time.time() - encoder_time_start
             # check depth
             # depths_my = gaussians["depths"]  # [1, V, H, W]
             # for nd, depth_i in enumerate(depths_my[0]):
@@ -761,7 +759,6 @@ class ModelWrapper(LightningModule):
                                 )
 
                 else:
-                    decoder_time_start = time.time()
                     output = self.decoder.forward(
                         gaussians,
                         camera_poses,
@@ -772,10 +769,6 @@ class ModelWrapper(LightningModule):
                         depth_mode=None,
                         vggt_meta=self.vggt_meta
                     )
-                    decoder_time_elapsed = time.time() - decoder_time_start
-                    print(f'encoder time: {encoder_time_elapsed:.2f}s, decoder time: {decoder_time_elapsed:.2f}s')
-                    precent_encoder, percent_decoder = encoder_time_elapsed/(encoder_time_elapsed+decoder_time_elapsed), decoder_time_elapsed/(encoder_time_elapsed+decoder_time_elapsed)
-                    print(f'encoder time percent: {precent_encoder:.2%}, decoder time percent: {percent_decoder:.2%}')
 
         (scene,) = batch["scene"]
         self.test_cfg.output_path = os.path.join(get_cfg()["output_dir"], "metrics")
@@ -1173,12 +1166,6 @@ class ModelWrapper(LightningModule):
                 ).items():
                     self._log_image_all(k, [prep_image(image)], step=self.global_step)
 
-            # Run video validation step.
-            video_viz_interval = max(int(self.train_cfg.video_viz_interval_steps), 1)
-            if (
-                self.global_step > 0
-                and self.global_step % video_viz_interval == 0
-            ):
                 self.render_video_interpolation(batch, vggt_meta=self.vggt_meta)
                 self.render_video_wobble(batch, vggt_meta=self.vggt_meta)
                 if self.train_cfg.extended_visualization:
